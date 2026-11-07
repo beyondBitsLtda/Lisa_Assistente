@@ -1,0 +1,467 @@
+import {
+  detectDateRange, buildPrompt, todayLabel, withPersona, withContextDocs, retrieve,
+} from "@/lib/rag.js";
+import { chatStream, detectTrelloAction } from "@/lib/gemini.js";
+import { buildActionProposal, buildClarifyPrompt, executeAction } from "@/lib/assistantActions.js";
+import { hasWorkTasks, getWorkTasksForContext } from "@/lib/workTasks.js";
+import { resolveScope } from "@/lib/scopeResolver.js";
+import { turnosValidos, blocoDaConversa, consultaDeBusca } from "@/lib/conversa.js";
+import { fonteDosQuadros } from "@/lib/configLisa.js";
+import { pareceAcao, pendenteValida } from "@/lib/acoesNoAbacato.js";
+import { tratarAcaoNoAbacato } from "@/lib/fluxoDeAcoesNoAbacato.js";
+import { comCodigoNaTela, secaoDoCodigoDaConversa } from "@/lib/codigoNaResposta.js";
+import { secaoDoDiagrama, filtroDaMarca } from "@/lib/diagramaDaLisa.js";
+import { secaoDoProjeto } from "@/lib/processmapNaConversa.js";
+import { webDaPergunta, fontesDaBusca } from "@/lib/buscaNaWeb.js";
+import { contextoDosRepositorios } from "@/lib/repositorioNaConversa.js";
+import { notaDasImagens, imagensValidas } from "@/lib/contextoDaConversa.js";
+import { sessaoDe } from "@/lib/papelNaSessao.js";
+import { usarDoDia } from "@/lib/usoDoDia.js";
+import { lerPerfil } from "@/lib/perfilDoUsuario.js";
+import { INSTRUCAO_DO_USUARIO, secaoDoPerfil, promptDoUsuario } from "@/lib/modoUsuario.js";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const CABECALHOS_SSE = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform", connection: "keep-alive" };
+
+/** O erro do Gemini numa frase para a pessoa (o mesmo para o admin e o usuário). */
+function erroAmigavel(err) {
+  const keySuffix = err?.keyLabel ? ` [${err.keyLabel}]` : "";
+  if (err?.code === "QUOTA") return `⚠️ Quota do Gemini cheia${keySuffix}. Aguarde cerca de 1 minuto e pergunte de novo.`;
+  if (err?.code === "UNAVAILABLE") return `⚠️ O Gemini está com alta demanda no momento${keySuffix} (já tentei de novo automaticamente). Espere um instante e pergunte de novo.`;
+  if (/too many subrequests/i.test(String(err?.message || err))) return "⚠️ Esta pergunta precisou de mais chamadas de rede do que o servidor deixa fazer de uma vez. Pergunte de novo; se repetir, tire uma imagem do contexto.";
+  return String(err?.message || err);
+}
+
+/**
+ * Manda os pedaços da resposta sem a marca [[DESENHAR]] (02/11/2026): a Lisa a escreve quando entendeu
+ * um pedido de desenho que veio parar na conversa e perguntou "Posso fazer?" — aí a página recebe o
+ * evento "desenho" e guarda o pedido, e o "sim" seguinte desenha (src/lib/codigoNaResposta.js).
+ */
+async function falarSemAMarca(controller, send, pedacos) {
+  const filtro = filtroDaMarca();
+  let falou = false;
+  for await (const piece of pedacos) {
+    const t = filtro.passar(piece);
+    if (t) { send(controller, "token", t); falou = true; }
+  }
+  const { resto, marcou } = filtro.fim();
+  if (resto) { send(controller, "token", resto); falou = true; }
+  if (marcou) send(controller, "desenho", { pedir: true });
+  // O Gemini às vezes termina sem texto nenhum (bloqueio, limite gasto pensando): sem isto a resposta
+  // chegava vazia e a janela ficava em "processando" (BEYOND-0011).
+  if (!falou) send(controller, "token", RESPOSTA_VAZIA);
+}
+
+const RESPOSTA_VAZIA = "Não consegui formar uma resposta agora (o modelo devolveu vazio). Pergunte de novo, de outro jeito se puder.";
+
+/**
+ * A conversa do USUÁRIO do MVP (01/11/2026: "quando um usuário que não seja eu logar, ele tem acesso a
+ * uma versão limitada"). Sem a base de conhecimento do admin (os documentos dele), sem o Abacato, a
+ * as tarefas do trabalho, a persona e o contexto pessoal dele. Com o perfil da entrevista, o Modo Tela
+ * (as imagens), os repositórios públicos que a tela leu antes
+ * (/api/repos/contexto, sem o token do admin), o código da conversa, o quadro e o projeto do ProcessMap
+ * dela. Conta no limite do dia (src/lib/usoDoDia.js).
+ */
+function conversaDoUsuario(req, body, question, images, dono) {
+  const encoder = new TextEncoder();
+  const send = (controller, event, data) => controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        send(controller, "context", []);
+        const limite = await usarDoDia(req, "pergunta");
+        if (limite) {
+          send(controller, "token", limite.erro);
+          send(controller, "done", { ok: true });
+          return;
+        }
+        const perfil = dono ? await lerPerfil(dono).catch(() => null) : null;
+        const turnos = turnosValidos(body.history?.turnos);
+        const web = await webDaPergunta(question, { turnos, ferramentasDoEscopo: [{ googleSearch: {} }] });
+        if (web.pesquisa) send(controller, "pesquisa", { consulta: web.pesquisa.consulta, buscador: web.pesquisa.buscador, total: web.pesquisa.resultados.length, lidas: web.paginas.length, erros: web.pesquisa.erros });
+        const nota = [notaDasImagens(images), web.nota].filter(Boolean).join("\n\n") || null;
+        const secaoDosRepos = typeof body.contextoDosRepos?.secao === "string" ? body.contextoDosRepos.secao.slice(0, 170_000) : "";
+        const prompt = promptDoUsuario(question, {
+          hoje: todayLabel(), nota, conversa: blocoDaConversa(turnos),
+          extra: secaoDoCodigoDaConversa(body.codigo) + secaoDoDiagrama(body.diagrama) + secaoDoProjeto(body.projeto) + secaoDosRepos,
+        });
+        const instrucao = comCodigoNaTela(INSTRUCAO_DO_USUARIO + secaoDoPerfil(perfil));
+        const metadados = [];
+        await falarSemAMarca(controller, send, chatStreamWithFallback(prompt, instrucao, web.ferramentas, images, (m) => metadados.push(m)));
+        const fontes = fontesDaBusca(metadados, 6, web.fontes);
+        if (fontes.length) send(controller, "fontes", fontes);
+        send(controller, "done", { ok: true });
+      } catch (err) {
+        send(controller, "error", { message: erroAmigavel(err) });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, { headers: CABECALHOS_SSE });
+}
+
+/**
+ * Gera a resposta com `tools` (grounding via Google Search); se a chamada falhar, tenta
+ * de novo SEM a ferramenta antes de desistir. Muitas contas/planos do Gemini não têm
+ * grounding com Google Search liberado, e a API costuma devolver isso como um erro que
+ * parece cota estourada — sem essa queda, o modo "Geral" nunca funcionaria nessas contas,
+ * mesmo a busca normal (sem web) estando totalmente disponível.
+ */
+// Filtro LOCAL (sem gastar chamada do Gemini) antes de decidir se vale a pena chamar
+// detectTrelloAction — sem isso, toda mensagem numa conversa com cards do Trello no
+// histórico disparava uma chamada extra ao Gemini, mesmo perguntas totalmente normais
+// ("obrigado", "e sobre X?"). Isso competia por cota com o resto do app (SYNC automático,
+// TTS, o chat em si) e ajudava a esgotar a cota bem mais rápido.
+const ACTION_VERB_RE = /reprogram|remarc|adia|prazo|mud[ae]|mov[ei]|movid|marc[ae]|marque|conclu|reabr|status|\blista\b|coluna|cancel[ae]|fech[ae]|fechad|resolvid|abert[oa]/i;
+const SHORT_REPLY_RE = /^\s*(sim|s|confirma|confirmo|pode|manda|isso|ok|beleza|claro|bora|faz|vai|n[ãa]o|n|cancela|cancele|espera|deixa)\b/i;
+
+/** Vale a pena chamar detectTrelloAction (custa uma chamada ao Gemini) pra esta mensagem? */
+function mightBeAction(question, hasPending) {
+  const q = (question || "").trim();
+  if (hasPending && SHORT_REPLY_RE.test(q)) return true; // resposta curta a uma ação pendente
+  return ACTION_VERB_RE.test(q);
+}
+
+// ---- consentimento pra falar de tarefas do trabalho (a empresa) ----
+// O usuário pediu explicitamente: SEMPRE perguntar antes de incluir dados do trabalho numa
+// resposta sobre tarefas — nunca entrar "de graça" no contexto, mesmo que a pergunta pareça
+// claramente sobre tarefas. Reaproveita o MESMO mecanismo de pendingAction já usado pras
+// ações do Trello (o cliente já guarda e devolve esse campo, sem precisar de código novo lá).
+const WORK_AFFIRMATIVE_RE = /^\s*(sim|s|claro|quero|pode|manda|isso|ok|okay|beleza|com certeza|positivo|uhum|manda ver)\b/i;
+const WORK_NEGATIVE_RE = /^\s*(n[ãa]o|n|deixa|dispensa|negativo|nem|sem isso|agora não|deixa pra l[áa])\b/i;
+
+/** Pergunta parece ser sobre tarefas? De propósito NÃO usa uma regex ampla tipo /tarefa/ pra
+ * texto livre — isso colidiria com comandos de ação do Trello ("conclua minha tarefa X") e
+ * perguntaria das tarefas do trabalho sem necessidade. Só dispara em sinais inequívocos: o seletor "Tarefas"
+ * do Assistente (scope.range) ou a própria pergunta citando um prazo/data. */
+function looksLikeTasksQuestion(question, scope) {
+  if (scope?.mode === "panel" && scope.range) return true;
+  if (scope && scope.mode !== "auto") return false; // outro escopo explícito (Geral, board, Brain, Sentinel) não é "tarefas"
+  return !!detectDateRange(question);
+}
+
+async function* chatStreamWithFallback(prompt, systemInstruction, tools, images, aoMetadados) {
+  const primary = chatStream(prompt, systemInstruction, { tools, images, aoMetadados });
+  let yieldedAny = false;
+  try {
+    for await (const piece of primary) {
+      yieldedAny = true;
+      yield piece;
+    }
+  } catch (err) {
+    // só cai pro modo sem ferramenta se AINDA NÃO saiu nenhum token — uma falha depois que
+    // a resposta já começou a chegar não pode ser "reiniciada" sem duplicar/misturar texto.
+    if (!tools || yieldedAny) throw err;
+    for await (const piece of chatStream(prompt, systemInstruction, { images })) yield piece;
+  }
+}
+
+/**
+ * POST /api/ask
+ * body: {
+ *   question: string, filterSource?: 'trello' | 'brain', scope?: Scope,
+ *   history?: { question: string, cards: Card[] },  // última pergunta+cards, pra ações do Assistente
+ *   pendingAction?: object,                          // ação proposta na resposta anterior, aguardando confirmação
+ * }
+ *
+ * Scope (opcional — vem do seletor "Este painel / Geral" do Assistente):
+ *   - { mode: "panel", board }   → força o board inteiro (bypassa detecção automática)
+ *   - { mode: "panel", range }   → força o filtro de prazo (hoje/semana/atrasadas...)
+ *   - { mode: "panel", source: "brain" } → só notas do Cérebro
+ *   - { mode: "panel", source: "sentinel" } → só chamados do Sentinela
+ *   - { mode: "general" }        → busca ampla em tudo (Trello + Brain + Sentinela) + grounding com Google Search
+ *   - ausente / { mode: "auto" } → comportamento padrão (detecção automática por regex)
+ *
+ * Ações no Trello (mudar prazo/lista/concluído) — só quando há cards do Trello no `history`
+ * (última resposta) ou uma `pendingAction` de antes: antes de responder normalmente, um passo
+ * rápido (detectTrelloAction) decide a intenção. Dois fluxos possíveis, nunca executando de
+ * cara:
+ *   - 1 card claramente identificado → propõe e pede confirmação ("sim"/"não") antes de agir.
+ *   - vários cards parecidos → pergunta numerado qual é; a resposta (número, ou descrição)
+ *     já resolve E executa, sem precisar de outro "confirma?" — escolher a opção certa É a
+ *     confirmação.
+ *
+ * Responde via SSE com estes eventos:
+ *   - "context": cards recuperados  → coluna RETRIEVED_CONTEXT
+ *   - "action":  { pending: object|null } → o cliente guarda isso e manda de volta no próximo pedido
+ *   - "token":   pedaços da resposta → transcript (estado SPEAKING)
+ *   - "done":    fim do stream
+ *
+ * `personaMode` (opcional, default false) — liga a personalidade de persona.md por cima da
+ * instrução normal (ver withPersona em rag.js). Vem do seletor de configurações do Assistente.
+ */
+export async function POST(req) {
+  const body = await req.json();
+  const { filterSource = null, history = null, pendingAction = null, images: rawImages = null } = body;
+  // question/scope/personaMode são `let` porque o fluxo de consentimento das tarefas do trabalho (abaixo)
+  // pode SUBSTITUÍ-los pela pergunta/escopo ORIGINAIS quando resolve um "sim"/"não" — o
+  // usuário respondeu à pergunta de consentimento, não fez uma pergunta nova de verdade.
+  let { question, scope = null, personaMode = false } = body;
+  let workConsent = false; // só vira true se o usuário confirmar explicitamente nesta troca
+  // uma ou mais imagens: as que a pessoa anexou (o + da barra, ou Ctrl+V), a câmera (Modo
+  // Observância) e/ou a captura de tela (Modo Tela) — cada uma valida sozinha, entradas
+  // malformadas simplesmente não entram na lista. Cada uma diz de onde veio (`origem`).
+  const images = imagensValidas(rawImages);
+
+  if (!question || typeof question !== "string") {
+    return new Response(JSON.stringify({ error: "question é obrigatório" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // o USUÁRIO do MVP (01/11/2026) tem a conversa dele, sem nada do admin — ver conversaDoUsuario
+  const sessao = sessaoDe(req);
+  if (sessao.papel === "usuario") return conversaDoUsuario(req, body, question, images, sessao.dono);
+
+  const encoder = new TextEncoder();
+  const send = (controller, event, data) =>
+    controller.enqueue(
+      encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    );
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        // ---- consentimento pra falar de tarefas do trabalho — ver comentário da regex acima ----
+        if (pendingAction?.type === "work_consent") {
+          const q = question.trim();
+          if (WORK_AFFIRMATIVE_RE.test(q)) workConsent = true;
+          if (WORK_AFFIRMATIVE_RE.test(q) || WORK_NEGATIVE_RE.test(q)) {
+            // resolvido (positivo ou negativo) — volta pra pergunta/escopo ORIGINAIS, que
+            // ficaram estacionados no pendingAction esperando essa resposta.
+            question = pendingAction.originalQuestion;
+            scope = pendingAction.scope;
+            personaMode = pendingAction.personaMode;
+          }
+          // nem sim nem não reconhecido — trata como uma pergunta NOVA (abandona o
+          // consentimento pendente) em vez de travar esperando um formato de resposta que
+          // talvez nunca venha
+        } else if (!pendingAction && !pareceAcao(question) && looksLikeTasksQuestion(question, scope) && await hasWorkTasks()) {
+          send(controller, "context", []);
+          send(controller, "action", { pending: { type: "work_consent", originalQuestion: question, scope, personaMode } });
+          send(controller, "token", "Antes de continuar — quer que eu leve em conta também as tarefas do trabalho?");
+          send(controller, "done", { ok: true });
+          return;
+        }
+
+        // ---- ações no Abacato (criar, editar, concluir, reabrir, mover, arquivar) ----
+        // Antes da resposta normal, em qualquer modo. Ver src/lib/fluxoDeAcoesNoAbacato.js.
+        const fonte = await fonteDosQuadros().catch(() => "abacato");
+        if (fonte === "abacato" && pendingAction?.type !== "work_consent") {
+          const pendente = pendenteValida(pendingAction);
+          if (pareceAcao(question, !!pendente)) {
+            let r = { respondeu: false };
+            try {
+              r = await tratarAcaoNoAbacato({
+                pergunta: question,
+                history,
+                pendente,
+                quadroPadrao: scope?.mode === "panel" && scope?.board ? scope.board : null,
+                // o rascunho de um card ("um pitch de vendas") é escrito com o que ela sabe do assunto
+                buscar: (texto) => retrieve(texto, { topK: 12, minSim: 0.25 }),
+              });
+            } catch (err) {
+              // O pedido de ação falhar não pode derrubar a conversa: segue para a resposta normal,
+              // mas avisa no registro o motivo de verdade.
+              // Um rascunho aberto não se perde por uma falha (Gemini sobrecarregado): fica pendente.
+              send(controller, "action", { pending: pendente?.type === "abacato_rascunho" ? pendente : null, debug: true, detectError: String(err?.message || err) });
+            }
+            if (r.respondeu) {
+              send(controller, "context", r.cards || []);
+              send(controller, "action", { pending: r.pending || null });
+              send(controller, "token", r.texto);
+              send(controller, "done", { ok: true });
+              return;
+            }
+          }
+        }
+
+        // ---- ações no Trello (só quando a fonte dos quadros é o Trello) ----
+        const candidateCards = fonte === "trello" ? (history?.cards || []).filter((c) => c.source === "TRELLO" && c.id) : [];
+        // exclui explicitamente o consentimento das tarefas do trabalho (não é uma ação do Trello — evita
+        // gastar uma chamada do Gemini tentando interpretar "sim"/"não" como ação de card)
+        const shouldCheckAction = fonte === "trello" && pendingAction?.type !== "work_consent" &&
+          (candidateCards.length || pendingAction) && mightBeAction(question, !!pendingAction);
+        if (shouldCheckAction) {
+          // se detectTrelloAction FALHAR (ex.: cota do Gemini), isso antes virava "none"
+          // silenciosamente — parecia "a Lisa não entendeu o pedido" quando na verdade a
+          // chamada nem chegou a rodar. Guarda o erro real pra mandar no debug abaixo.
+          let detectError = null;
+          const intent = await detectTrelloAction({
+            question, todayLabel: todayLabel(), candidateCards, pendingAction,
+          }).catch((err) => {
+            detectError = `${String(err?.message || err)}${err?.keyLabel ? ` [${err.keyLabel}]` : ""}`;
+            return { intent: "none" };
+          });
+
+          if (intent.intent === "propose_action") {
+            try {
+              const pending = await buildActionProposal(intent);
+              send(controller, "context", candidateCards);
+              send(controller, "action", { pending });
+              send(controller, "token", pending.summary);
+              send(controller, "done", { ok: true });
+              return;
+            } catch (err) {
+              // não deixa cair pro fluxo normal (que poderia "confirmar" algo que não foi
+              // resolvido) — avisa o erro real e para por aqui.
+              send(controller, "context", candidateCards);
+              send(controller, "action", { pending: null });
+              send(controller, "token", `⚠️ Entendi que você quer mudar algo, mas não consegui: ${err.message}`);
+              send(controller, "done", { ok: true });
+              return;
+            }
+          }
+          if (intent.intent === "clarify_candidates" && intent.candidate_ids?.length >= 2) {
+            const chosen = candidateCards.filter((c) => intent.candidate_ids.includes(c.id));
+            if (chosen.length >= 2) {
+              const pending = buildClarifyPrompt({ field: intent.field, new_value: intent.new_value, candidates: chosen });
+              send(controller, "context", candidateCards);
+              send(controller, "action", { pending });
+              send(controller, "token", pending.summary);
+              send(controller, "done", { ok: true });
+              return;
+            }
+            // menos de 2 sobraram depois de cruzar com os candidatos reais — trata como "none"
+            // e cai pro fluxo normal abaixo, em vez de mostrar uma lista vazia/de 1 item.
+          }
+          if (intent.intent === "select_candidate" && pendingAction?.type === "clarify") {
+            const match = pendingAction.candidates.find((c) => c.card_id === intent.card_id);
+            if (match) {
+              try {
+                const resultText = await executeAction({
+                  card_id: match.card_id, card_title: match.title,
+                  field: pendingAction.field, new_value: pendingAction.new_value,
+                });
+                send(controller, "context", candidateCards);
+                send(controller, "action", { pending: null });
+                send(controller, "token", resultText);
+                send(controller, "done", { ok: true });
+                return;
+              } catch (err) {
+                send(controller, "context", candidateCards);
+                send(controller, "action", { pending: null });
+                send(controller, "token", `⚠️ Não consegui aplicar a mudança: ${err.message}`);
+                send(controller, "done", { ok: true });
+                return;
+              }
+            }
+            // não bateu com nenhum candidato da lista — cai pro "none"/fluxo normal, deixando
+            // a pendingAction como estava (o cliente manda de volta e tenta de novo)
+          }
+          if (intent.intent === "confirm_pending" && pendingAction?.type === "confirm") {
+            let resultText;
+            try {
+              resultText = await executeAction(pendingAction);
+            } catch (err) {
+              resultText = `⚠️ Não consegui aplicar a mudança: ${err.message}`;
+            }
+            send(controller, "context", candidateCards);
+            send(controller, "action", { pending: null });
+            send(controller, "token", resultText);
+            send(controller, "done", { ok: true });
+            return;
+          }
+          if (intent.intent === "cancel_pending" && pendingAction) {
+            send(controller, "context", candidateCards);
+            send(controller, "action", { pending: null });
+            send(controller, "token", "Beleza, não mudei nada.");
+            send(controller, "done", { ok: true });
+            return;
+          }
+          // "none" → segue pro fluxo normal de RAG abaixo. Manda um evento mesmo assim (com
+          // debug=true) só pra aparecer no log do HUD que a detecção rodou e não achou nada —
+          // ajuda a diagnosticar se o roteamento de ação estiver falhando de novo.
+          send(controller, "action", { pending: pendingAction || null, debug: true, checkedIntent: intent.intent, detectError });
+        }
+
+        // roteamento de escopo (Tarefas/Boards/Sentinela/Trabalho/Brain/Geral) — extraído pra
+        // src/lib/scopeResolver.js, reaproveitado também pelas falas agendadas (ver
+        // src/lib/scheduledAnnouncements.js), pra nunca divergir entre os dois usos.
+        // A conversa até aqui (BEYOND-0006): vai no prompt, e uma continuação curta ("e o prazo
+        // dele?") busca contexto junto com a pergunta anterior — sozinha não acharia nada.
+        const turnos = turnosValidos(history?.turnos);
+        const { matches, systemInstruction, tools, promptNote } = await resolveScope(scope, consultaDeBusca(question, turnos), { filterSource });
+
+        send(controller, "context", matches);
+
+        // Modo Observância (câmera) e/ou Modo Tela (captura de tela) — ver assistant/page.js:
+        // avisa o Gemini que há imagem(ns) anexada(s) e pra que servem, senão ele não sabe
+        // que pode/deve olhar pra elas ao responder.
+        // (a nota diz o que é cada imagem, na ordem: anexadas pela pessoa, tela, câmera — ver
+        // src/lib/contextoDaConversa.js)
+        const imageNote = notaDasImagens(images);
+        // Tarefas do trabalho — só entra se o usuário CONFIRMOU no fluxo de consentimento acima;
+        // nunca é buscado/incluído de graça.
+        const workNote = workConsent
+          ? `TAREFAS DO TRABALHO (da empresa onde o usuário trabalha) — o usuário PEDIU EXPLICITAMENTE\npra considerar isso agora:\n${await getWorkTasksForContext()}`
+          : null;
+        // pediu internet (pesquisar, procurar na web, um site ou link na mensagem): em qualquer escopo,
+        // o servidor pesquisa e o Gemini abre as páginas (src/lib/buscaNaWeb.js)
+        const web = await webDaPergunta(question, { turnos, ferramentasDoEscopo: tools });
+        if (web.pesquisa) send(controller, "pesquisa", { consulta: web.pesquisa.consulta, buscador: web.pesquisa.buscador, total: web.pesquisa.resultados.length, lidas: web.paginas.length, erros: web.pesquisa.erros });
+        const combinedNote = [promptNote, imageNote, workNote, web.nota].filter(Boolean).join("\n\n") || null;
+
+        // o código que já apareceu na conversa vai inteiro (a conversa em si vai cortada por fala),
+        // para a Lisa ver o todo antes de propor uma correção
+        // os repositórios VINCULADOS à conversa (o + da barra, ou um link do GitHub na mensagem): a
+        // Lisa lê os arquivos que importam para a pergunta — escolhidos também pelo que está na
+        // tela — e responde com o código real (ver src/lib/repositorioNaConversa.js)
+        // A tela lê os repositórios ANTES, num pedido próprio (/api/repos/contexto), e manda a seção
+        // pronta: lida aqui, a leitura somava as chamadas dela com as desta pergunta e estourava o
+        // limite de 50 chamadas de rede por pedido do Worker. `repos` cru continua valendo para uma
+        // aba antiga, ainda com o código de antes.
+        let secaoDosRepos = "";
+        if (typeof body.contextoDosRepos?.secao === "string") {
+          secaoDosRepos = body.contextoDosRepos.secao.slice(0, 170_000);
+        } else if (Array.isArray(body.repos) && body.repos.length) {
+          const r = await contextoDosRepositorios({ vinculos: body.repos, pergunta: question, conversa: blocoDaConversa(turnos), imagens: images })
+            .catch((err) => ({ secao: "", lidos: [], avisos: [String(err?.message || err)] }));
+          secaoDosRepos = r.secao;
+          send(controller, "repos", { lidos: r.lidos, repos: r.repos || [], avisos: r.avisos });
+        }
+        const prompt = buildPrompt(question, matches, combinedNote, blocoDaConversa(turnos), secaoDoCodigoDaConversa(body.codigo) + secaoDoDiagrama(body.diagrama) + secaoDoProjeto(body.projeto) + secaoDosRepos);
+        // em qualquer modo: quando o assunto é código, a resposta traz o código em blocos e a tela
+        // abre o editor que digita (src/lib/codigoNaResposta.js, src/components/panels/IdeDaLisa.js)
+        const instrucao = withContextDocs(withPersona(comCodigoNaTela(systemInstruction), personaMode));
+        const metadados = [];
+        await falarSemAMarca(controller, send, chatStreamWithFallback(prompt, instrucao, web.ferramentas, images, (m) => metadados.push(m)));
+        // as páginas lidas e os primeiros resultados: links embaixo da resposta (não entram na fala)
+        const fontes = fontesDaBusca(metadados, 6, web.fontes);
+        if (fontes.length) send(controller, "fontes", fontes);
+
+        send(controller, "done", { ok: true });
+      } catch (err) {
+        // gemini.js já tenta de novo sozinho pra erros transitórios (429/503) e troca o
+        // JSON cru da API por um erro com .code curto — só resta mapear pra uma frase.
+        // err.keyLabel (ver rewriteError em gemini.js) diz qual CHAVE do pool falhou — sem
+        // repassar isso, "cota cheia" parecia sempre a mesma coisa não importava se foi a
+        // chave prioritária (paga) ou uma de reserva (grátis), impossível de diferenciar.
+        const keySuffix = err?.keyLabel ? ` [${err.keyLabel}]` : "";
+        const friendly =
+          err?.code === "QUOTA"
+            ? `⚠️ Quota do Gemini cheia${keySuffix}. Aguarde cerca de 1 minuto e pergunte de novo. (Dica: evite clicar em SYNC logo antes de perguntar.)`
+            : err?.code === "UNAVAILABLE"
+            ? `⚠️ O Gemini está com alta demanda no momento${keySuffix} (já tentei de novo automaticamente). Espere um instante e pergunte de novo.`
+            : /too many subrequests/i.test(String(err?.message || err))
+            ? "⚠️ Esta pergunta precisou de mais chamadas de rede do que o servidor deixa fazer de uma vez (o Gemini pode ter pedido várias tentativas). Pergunte de novo; se repetir, tire uma imagem do contexto."
+            : String(err?.message || err);
+        send(controller, "error", { message: friendly });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+    },
+  });
+}

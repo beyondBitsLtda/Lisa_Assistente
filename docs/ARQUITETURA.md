@@ -1,0 +1,367 @@
+# Lisa — arquitetura e funcionamento
+
+Este documento explica como as peças da Lisa funcionam por dentro: de onde vêm os dados, como a
+sincronização e as cotas do Gemini funcionam, os modos especiais e o mapa das rotas. Para instalar
+e configurar, comece pelo [README](../README.md).
+
+> Algumas seções citam a Vercel, onde a Lisa morou antes da Cloudflare. O código roda nos dois:
+> o que muda é onde ficam as variáveis e quem agenda os crons (ver `db/cron.sql` e
+> `workers/lisa-cron`).
+
+## Duas fontes de dado bem diferentes: tela (ao vivo) × Assistente (embeddings)
+
+O app tem duas operações que dependem do Trello de jeitos diferentes, e é importante não
+confundir uma com a outra:
+
+- **Tela** (Kanban, Boards, Dashboard, Tarefas) e **notificações push** (card novo, tarefa
+  atrasada) — leem o Trello **direto e ao vivo** (`src/lib/liveTrello.js` → `loadTrello()`),
+  sem passar pelo Supabase nem pelo Gemini. Sempre atual, sem depender do SYNC. O
+  **↻ ATUALIZAR** de cada painel só dispara essa leitura ao vivo (rápida, sem custo de API) —
+  e cada um desses painéis também se atualiza sozinho a cada 1 min.
+- **Assistente** (busca semântica livre, tipo "quais tarefas tenho relacionadas a X") —
+  essa sim depende de embeddings gerados pelo Gemini, gravados em `public.documents`
+  (Supabase) pelo **◈ SYNC**. Perguntas por board específico ou por prazo ("tarefas de hoje",
+  "cards do CRM") também já são ao vivo — só a busca semântica livre, sem filtro, é que
+  precisa do índice do SYNC.
+
+## SYNC — como funciona, e como automatizar de hora em hora
+
+O botão **◈ SYNC** (Topbar, aparece em toda aba) é o jeito de manter o índice semântico do
+Assistente em dia: ele lê o Trello + Cérebro, gera embeddings (Gemini) e grava em
+`public.documents` (Supabase).
+
+Como o plano Hobby da Vercel limita funções a 60s e o Gemini tem cota de embeddings por
+minuto, uma sincronização completa é fatiada em várias chamadas pequenas a `/api/ingest`
+(≤20 chunks por chamada) — é por isso que o SYNC "demora" e mostra progresso nos logs, em vez
+de ser instantâneo.
+
+**Pra rodar isso (e as notificações push) automaticamente, sem precisar clicar em nada:**
+
+1. Rode `db/schema.sql` (se ainda não rodou) — cria `public.sync_progress`, que guarda o
+   progresso do ciclo automático.
+2. Rode `db/cron.sql` no SQL Editor do Supabase, depois de trocar os placeholders (domínio +
+   `INGEST_SECRET` + `CRON_SECRET`) pelos valores reais. Isso agenda, via `pg_cron` + `pg_net`
+   (extensões nativas do Supabase, sem custo extra):
+   - **SYNC** — a cada hora (minuto 0) reinicia o ciclo, e a cada 2 min avança uma fatia
+     (`/api/cron/sync`) — sem custo quando não há ciclo em andamento. 2 em 2 min, não 1 em 1,
+     de propósito: cada fatia chama o Gemini pra gerar embeddings, e isso disputa cota com o
+     chat/voz do Assistente — mais devagar sobra mais cota pro uso interativo;
+   - **Notificações** — a cada 5 min chama `/api/cron/notify` (chamado novo/reaberto, SLA
+     estourando, tarefa atrasada).
+
+O progresso do SYNC mora inteiro no Postgres (`public.sync_progress`, linha única) — a Vercel
+não precisa ficar "acordada" entre os ticks, e reiniciar o deploy não perde o lugar onde parou.
+O Topbar mostra um indicador **AUTO-SYNC** com a última execução (passe o mouse pra detalhes).
+
+⚠️ **Por que isso não está em `vercel.json`:** o plano Hobby da Vercel só permite cron nativo
+**1x por dia** — um cron mais frequente que isso **falha o deploy inteiro** (foi o que aconteceu:
+o `/api/cron/notify` ficou configurado pra rodar a cada 5 min em `vercel.json`, e isso quebrou
+todo deploy subsequente por dias, sem sintoma óbvio além do "X" nos checks do GitHub). Por isso
+os dois crons agora são agendados pelo **Supabase** (que não tem esse limite), e `vercel.json`
+ficou vazio — as rotas continuam sendo funções normais da Vercel, só não são mais "cron jobs"
+aos olhos dela.
+
+---
+
+## Cota do Gemini — várias chaves com troca automática
+
+O plano gratuito do Gemini tem limite por minuto **e** por dia — com o SYNC automático rodando
+o dia inteiro em segundo plano mais o uso normal do Assistente, é fácil esbarrar nisso.
+
+Pra aliviar, o app aceita **mais de uma API key**, testando na ordem e trocando pra próxima
+automaticamente quando uma bate no limite de cota (não troca por outros tipos de erro):
+
+```
+GEMINI_API_KEYS=chave-do-projeto-1,chave-do-projeto-2,chave-do-projeto-3
+```
+
+Defina essa variável (em vez de `GEMINI_API_KEY`) na Vercel e no `.env`, separando as chaves por
+vírgula. **Cada chave precisa vir de um projeto diferente** no Google Cloud/AI Studio — chaves do
+mesmo projeto compartilham a mesma cota, então usar várias delas não ajuda em nada. Dá pra criar
+vários projetos na mesma conta Google (não precisa de contas separadas), gerando uma API key nova
+em cada um.
+
+Sem `GEMINI_API_KEYS`, o app continua funcionando normalmente só com `GEMINI_API_KEY` (uma chave).
+
+---
+
+## Map of Deploy — onde cada aplicação está hospedada, e se está no ar
+
+O **mapa** é um quadro do Trello, e continua sendo: a **coluna** é o servidor de hospedagem
+(CloudFlare, GitHub Pages, Vercel…), a **etiqueta** do card é a conta em que a hospedagem está, o
+**nome** do card é a aplicação e a **descrição** carrega o link. O painel lê esse quadro e
+acrescenta o que o Trello não sabe: se a aplicação respondeu.
+
+Duplicar o mapa no banco criaria duas verdades — por isso o Supabase guarda só o histórico de
+checagens (`deploy_checks`, item 28 do `db/schema.sql`).
+
+Pra ligar:
+
+1. **`TRELLO_DEPLOY_BOARD_ID`** (obrigatória para o mapa): o id ou o código curto do quadro do
+   Trello com as aplicações. Usa as mesmas `TRELLO_KEY`/`TRELLO_TOKEN` do resto.
+2. **Criar a tabela** `deploy_checks` no Supabase (`db/schema.sql`). Sem ela o mapa ainda aparece,
+   só sem uptime nem contagem de quedas — e o painel avisa isso na tela.
+3. **Agendar `/api/cron/deploy-check`** na Vercel (Settings → Cron Jobs), de 5 em 5 ou de 15 em 15
+   minutos. É o tique que constrói o histórico: sem ele existe o estado do instante em que você
+   abriu a tela, e mais nada. Com `CRON_SECRET` definida, a Vercel manda o Bearer sozinha.
+
+No painel, **"quedas" conta episódios, não checagens**: três horas fora com checagem de 5 em 5
+minutos é *uma* queda, não trinta e seis. Clicar num card abre a pré-visualização do deploy num
+iframe — boa parte das hospedagens recusa ser embutida (`X-Frame-Options`), e nesse caso o painel
+diz isso em vez de mostrar um quadrado em branco.
+
+`npm run deploy-map` confere a leitura do quadro e a matemática de disponibilidade sem precisar do
+Trello nem do Supabase de pé.
+
+## Dashboard em AR (WebXR)
+
+Em `/dashboard/ar` (botão "◫ MODO AR" no Dashboard normal): aponta a câmera do celular pra
+uma parede ou mesa, toca na tela pra fixar ali um painel com os mesmos gráficos do Dashboard
+(cards por board, carga por board, tendência do Sentinela), que fica ancorado no espaço
+enquanto você anda pela sala.
+
+- **Só funciona no Chrome/Android com suporte a ARCore** — usa a API WebXR
+  (`navigator.xr`, sessão `immersive-ar` + `hit-test`). **Safari/iOS não suporta WebXR
+  immersive-ar** (só existiria via app nativo com ARKit); no iPhone a página mostra um aviso
+  explicando isso em vez de tentar simular AR de qualquer jeito.
+- O painel não é o componente React de sempre renderizado como HTML — é desenhado direto em
+  Canvas 2D (`src/lib/arCanvasCharts.js`, mesma paleta de `src/lib/chartPalette.js`) e aplicado
+  como textura numa malha 3D via `three.js`, porque uma textura WebGL não pode vir de SVG/HTML
+  sem risco de "contaminar" o canvas.
+- Os dados são as mesmas fontes ao vivo do Dashboard normal (Trello/Sentinela direto, sem
+  SYNC/embeddings), atualizando sozinho a cada 45s enquanto a sessão AR estiver aberta.
+- **Reconhecimento de tela (opcional):** o MODO TV do Dashboard mostra um QR discreto no
+  canto (`src/components/panels/TvArMarker.js`). No modo AR, o botão "🔍 ESCANEAR TELA" abre
+  uma pré-visualização de câmera comum (sem WebXR ainda) que procura esse QR via
+  `BarcodeDetector` — API nativa do Chrome/Android. O WebXR não dá acesso a pixel bruto de
+  câmera pra "reconhecer a tela só de olhar" (bloqueado por privacidade), então o QR é o que
+  torna isso confiável. Ao achar, já reage na hora com uns KPIs "3D" flutuando sobre o próprio
+  preview (`src/lib/qrPseudo3d.js`, canvas puro, sem engine 3D) — só depois, se quiser, entra
+  em AR de verdade pra fixar o painel completo no espaço.
+- Fixação com preview ao vivo: o painel aparece semitransparente seguindo a mira em tempo
+  real ANTES de fixar (não é "tocar e já cravar às cegas"). Depois de fixado, ajusta com
+  gestos — arrastar (1 dedo), redimensionar e girar (2 dedos) — sem depender de acertar o
+  hit-test de novo.
+
+## Modo Observância (câmera) e Modo Tela
+
+Dois toggles no Assistente que tornam a conversa multimodal (mesmo modelo de chat,
+`gemini-2.5-flash`, também enxerga imagem — sem endpoint/modelo separado):
+
+- **👁 Observância** (câmera, desktop + mobile): liga a câmera frontal; cada pergunta manda
+  um retrato do instante junto pro Gemini responder (postura, roupa, gesto, expressão).
+- **🖵 Tela** (`getDisplayMedia`, desktop-only — "enquanto mexo no PC"): mesma ideia, mas a
+  imagem é uma captura de tela. Tem um sub-modo **💬 AUTO**: vigia sozinha a cada 4 min
+  (`/api/screen-comment`) e só fala alguma coisa quando o Gemini decide que há algo
+  genuinamente digno de nota — na maioria das vezes fica em silêncio. Fala com a voz do
+  NAVEGADOR (não a do Gemini) de propósito, pra não competir por cota de TTS com a conversa
+  principal nem interromper uma resposta em andamento.
+
+Nenhuma das duas fica ligada sozinha entre recarregamentos (sem localStorage, de propósito —
+é câmera/tela, cada sessão pede de novo) e nenhuma foto é salva em lugar nenhum, nem local
+nem no Supabase — só trafega pro Gemini na hora e é descartada.
+
+## Modo Tomar nota
+
+A Lisa escuta por até **10 minutos** e, no fim, anota no Abacato o que ouviu, separado por
+assunto. Abre pelo botão de nota na barra de modos do celular, por **Modos → Trabalho → Tomar
+nota** no desktop ou dizendo "tomar nota sobre…" no chat.
+
+1. **Tema.** Digitado, falado (o microfone ao lado do campo: quando você termina de falar, a
+   gravação começa sozinha) ou em branco — aí ela deduz pelo que ouvir.
+2. **Escuta.** O gravador é um AudioWorklet (`src/lib/tomarNota.js`): reduz o áudio para
+   16 kHz mono, conta o tempo pelas amostras e corta trechos de 25 a 35 s numa pausa da fala.
+   Cada trecho vai para `/api/notas/trecho` assim que fecha e volta como texto; trecho sem
+   som nenhum nem sai do aparelho.
+3. **Organização.** `/api/notas/organizar` manda a transcrição inteira para o Gemini, que
+   filtra pelo tema e separa em notas (título, interpretação, pontos, encaminhamentos e
+   citações). As citações são conferidas contra a transcrição: só entra como "transcrição
+   literal" o que foi dito de verdade, com o minuto.
+4. **Abacato.** Quadro **Notas** do usuário do Abacato com o mesmo e-mail da sessão da Lisa
+   (criado na primeira vez), uma coluna por tema (o mesmo tema volta para a mesma coluna) e
+   um card por nota, mais um card com a transcrição completa. Quadro e cards levam
+   `origem = "lisa"`; o índice único de `(origem, origem_id)` dos cards impede que uma
+   segunda tentativa da mesma gravação duplique as notas.
+
+**Com a tela apagada.** O microfone aberto mantém a página viva no **Android** e no
+**computador**: a gravação continua e, no fim, dois bipes avisam (e uma notificação, se o
+navegador já tiver permissão). No **iPhone**, o Safari desliga o microfone das páginas quando
+a tela bloqueia — por isso lá "Manter a tela ligada" (Wake Lock) vem marcado; se a gravação
+for interrompida, a tela oferece continuar de onde parou.
+
+**Visual.** Enquanto escuta, o centro do painel é o visual escolhido para a Lisa (o mesmo do
+Assistente), mexendo com o volume; transcrevendo e organizando, ele fica "pensando".
+
+**Privacidade.** O áudio não é salvo em lugar nenhum: só trafega para o Gemini na hora. O
+texto já transcrito fica no `localStorage` do aparelho até ser organizado, para sobreviver a
+um recarregamento no meio. Testes: `npm run notas-check`.
+
+## Uso dos usuários (painel do admin)
+
+**Onde fica e quem vê:** **/uso**, no menu Painéis → Sistema → "Uso dos usuários". Só o admin abre: o portão barra
+o usuário, e a rota `/api/uso-dos-usuarios` confere de novo.
+
+**O que mostra:** por período (7, 30 ou 90 dias), uma linha por pessoa, com:
+- o último acesso, os acessos e os logins;
+- o tempo na Lisa, a média e os dias ativos;
+- as telas onde mais ficou;
+- o que fez: perguntas, desenhos, comentários de tela, falas (de `lisa_uso`) e fluxogramas criados.
+
+Clicar na pessoa abre cada acesso, o tempo por tela, a data de criação da conta e o último login.
+
+**Como o tempo é medido:**
+- **A batida:** `src/components/shell/Presenca.js`, em todas as telas, manda uma batida por minuto para
+  `/api/presenca` com a aba visível. Cada batida soma o tempo desde a anterior, com teto de 90 s.
+- **O acesso:** uma pausa de mais de 5 minutos fecha o acesso. O login também abre um.
+- **Onde está:** a regra fica em `src/lib/usoDosUsuarios.js`; a tabela é `lisa_presenca`
+  (`db/uso_dos_usuarios.sql`).
+
+**Privacidade:**
+- **O que se guarda:** só quando, quanto tempo, onde e o tipo de aparelho; o conteúdo das conversas não entra.
+- **Transparência:** a tela de entrada avisa que o uso é registrado.
+
+**Testes:** `npm run uso-check`.
+
+## Instalar como app
+
+A Lisa é instalável pelo Chrome (desktop e Android): `public/manifest.webmanifest` (abre em
+`/assistant`, com o atalho "Tomar nota" → `/assistant?modo=tomar-nota`) e os ícones em
+`public/marca/app-*.png`. O manifesto é buscado sem cookie, por isso está em `LIVRES`
+(`src/lib/authSession.js`); `marca/` já fica fora do middleware.
+
+O aviso "pode instalar" do Chrome (`beforeinstallprompt`) chega uma vez e cedo: um script no
+`<head>` (`src/lib/instalarApp.js`) o guarda em `window`, e o item "Instalar a Lisa como app"
+(menu do pontinho verde no desktop, ajustes no celular) só aparece quando ele existe. No iPhone
+não há esse aviso: o item explica Compartilhar → "Adicionar à Tela de Início". O Abacato tem o
+mesmo botão (`Abacatosys/abacato/src/componentes/BotaoInstalar.js`).
+
+Para conferir: DevTools → Application → Manifest, ou `Page.getInstallabilityErrors` pelo
+protocolo do DevTools. Em `next dev` o link do manifesto sai fora do `<head>` e o Chrome o
+ignora — confira com `next build` + `next start`.
+
+## Estrutura
+
+```
+lisa-assistente/
+├─ .env.local           # SEGREDOS (gitignored)
+├─ .env.example         # modelo sem segredos (versionado)
+├─ vercel.json          # vazio de propósito — crons vivem no Supabase, não aqui (ver db/cron.sql)
+├─ db/
+│  ├─ schema.sql        # pgvector + documents + match_documents + sync_progress
+│  └─ cron.sql          # agenda SYNC (1x/hora) e notificações (1x/5min) via pg_cron + pg_net
+├─ src/
+│  ├─ lib/
+│  │  ├─ supabase.js    # cliente service_role (SERVER-ONLY)
+│  │  ├─ gemini.js      # embeddings + chat streaming
+│  │  ├─ rag.js         # busca + prompt + persona (Lisa)
+│  │  ├─ sync.js         # loop do botão SYNC manual (navegador)
+│  │  └─ ingest/{chunk,trello,brain,runSlice}.js  # runSlice = 1 fatia, usado pelo manual E pelo cron
+│  └─ app/
+│     ├─ layout.js
+│     ├─ page.js        # HUD (interface) ligado ao /api/ask
+│     ├─ globals.css
+│     └─ api/
+│        ├─ ask/route.js         # SSE: context/token/done
+│        ├─ ingest/route.js      # 1 fatia de reindexação (botão SYNC manual)
+│        ├─ sync-status/route.js # status do SYNC automático (indicador AUTO-SYNC no Topbar)
+│        ├─ cron/sync/route.js   # 1 fatia de reindexação (tick automático — Supabase pg_cron)
+│        ├─ cron/notify/route.js # notificações push (tick automático — Supabase pg_cron)
+│        └─ health/route.js      # bolinhas de conexão
+└─ scripts/{ingest,ask}.mjs
+```
+
+## Mapeamento das rotas
+
+Esta seção mapeia como o projeto se organiza no Next.js: as rotas (telas e endpoints), os
+componentes que elas carregam e o caminho que uma pergunta percorre — da interface ao servidor,
+passando pelo RAG no Supabase, até a resposta da Lisa chegar em tempo real.
+
+O projeto usa o **App Router do Next.js 15**: uma interface HUD em tempo real ligada a um cérebro
+RAG, com embeddings gerados pelo Gemini e busca vetorial (pgvector) no Supabase.
+
+### Como o App Router organiza as pastas
+
+No App Router, **a pasta é o endereço**: cada pasta dentro de `src/app` vira um trecho da URL, e o
+arquivo dentro dela diz o que aquele endereço é.
+
+| Arquivo | Papel |
+|---|---|
+| `page.js` | uma **tela** (o que aparece no navegador naquele endereço) |
+| `route.js` | um **endpoint HTTP** (roda só no servidor e responde JSON ou um stream) |
+| `layout.js` | a **moldura** que envolve todas as telas daquela pasta e das de dentro |
+
+- `src/app/layout.js` — o layout raiz: `<html>`, `<body>`, título e viewport de todas as páginas.
+- `src/app/(panels)/` — um **grupo de rotas**: os parênteses organizam as pastas, mas **não entram
+  na URL** (`(panels)/tasks/page.js` responde em `/tasks`). Todas as telas do grupo dividem o
+  `(panels)/layout.js`, que as envolve no `Shell` (`src/components/shell/Shell.js`): o fundo com
+  grid, a barra lateral, a barra de topo e, no celular, o menu que abre pelo hambúrguer.
+- `src/app/mundo/` e `src/app/pair/` — ficam **fora** do grupo de propósito: abrem como janelas
+  próprias, sem barra lateral nem de topo, e cada uma tem um `layout.js` que define o título da
+  janela.
+- `src/app/api/**/route.js` — os endpoints; cada um declara `runtime = "nodejs"`.
+
+### Telas (`page.js`)
+
+| Rota | Arquivo | O que é |
+|---|---|---|
+| `/` | `src/app/(panels)/page.js` | a tela inicial: o Kanban do quadro padrão |
+| `/assistant` | `src/app/(panels)/assistant/page.js` | o HUD da Lisa: chat em streaming, voz, câmera, tela e seletor de escopo — é quem chama o `/api/ask` |
+| `/mundo` | `src/app/mundo/page.js` | o ambiente virtual da Lisa, em janela dedicada |
+| `/pair` | `src/app/pair/page.js` | o ambiente de pair programming, em janela dedicada |
+
+A tela inicial (`/`) é só um ponto de entrada: ela não desenha nada sozinha, carrega o componente
+`KanbanBoard` (`src/components/panels/KanbanBoard.js`) já apontado para o quadro certo — a constante
+`QUARTO_DE_GUERRA` (de `src/lib/boards.js`), o quadro que abre por padrão quando o sistema inicia.
+
+```js
+export default function WarRoomPage() {
+  return <KanbanBoard board={QUARTO_DE_GUERRA} />;
+}
+```
+
+Os outros painéis seguem a mesma regra (uma pasta = uma rota, todos dentro do `Shell`): `/boards`,
+`/tasks`, `/dashboard` (e `/dashboard/ar`), `/work-tasks`, `/sentinel`, `/map-of-deploy`, `/news`,
+`/sync-status`, `/code-repos`, `/code-tasks`, `/gemini-keys`, `/scheduled-announcements`,
+`/test-mode`, `/thoughts` e `/arch-docs`.
+
+### Endpoints principais (`route.js`)
+
+| Endpoint | Arquivo | O que faz |
+|---|---|---|
+| `POST /api/ask` | `src/app/api/ask/route.js` | a rota do chat, em **Server-Sent Events (SSE)**: recebe a pergunta, o escopo e o histórico; trata pedidos de ação nos cards do Trello (propõe e só aplica depois da confirmação); busca o contexto via RAG e transmite a resposta. Eventos: `context`, `action`, `token`, `done` (e `error`) |
+| `GET/POST /api/ingest` | `src/app/api/ingest/route.js` | processa **uma fatia** da reindexação (fonte `trello`, `brain` ou `github`); é chamada em loop pelo botão SYNC e, sozinha, pelo `/api/cron/sync` (pg_cron do Supabase). Exige o `INGEST_SECRET` quando ele está configurado |
+| `GET /api/health` | `src/app/api/health/route.js` | a saúde dos serviços — `{ supabase, trello, gemini, sentinel }`, `true` = ok — que acende as bolinhas de conexão da interface |
+
+### O caminho de uma pergunta (ponta a ponta)
+
+1. **Entrada:** a pessoa digita (ou fala) a pergunta no HUD, em `/assistant`.
+2. **Envio:** o cliente faz um `POST /api/ask` com a pergunta, o escopo ativo e o histórico da conversa.
+3. **Ação ou pergunta?** Se a mensagem pede uma mudança num card (mover, mudar prazo, concluir), o
+   `detectTrelloAction` reconhece a intenção e a rota devolve uma proposta (evento `action`) — nada
+   muda sem a confirmação da pessoa. Senão, segue para a resposta.
+4. **Recuperação de contexto (RAG):** o `resolveScope` (`src/lib/scopeResolver.js`) escolhe a busca
+   certa para o escopo; o `retrieve` (`src/lib/rag.js`) gera o embedding da pergunta com o
+   `embedOne` (`src/lib/gemini.js`) e chama a função `match_documents` no Supabase — a busca
+   vetorial que devolve os trechos mais parecidos. Esses trechos vão para a tela no evento `context`.
+5. **Geração:** o `buildPrompt` junta a pergunta e o contexto, e o `chatStream` envia ao Gemini, que
+   responde em streaming.
+6. **Resposta em tempo real:** cada pedaço da resposta chega ao cliente como um evento `token` —
+   a interface mostra (e a voz lê) enquanto o texto ainda está sendo gerado — e o evento `done`
+   encerra o stream.
+
+```mermaid
+sequenceDiagram
+  participant U as HUD (/assistant)
+  participant A as /api/ask
+  participant G as Gemini
+  participant S as Supabase (pgvector)
+  U->>A: POST pergunta + escopo + histórico
+  A->>G: embedOne(pergunta)
+  G-->>A: embedding da pergunta
+  A->>S: rpc match_documents
+  S-->>A: trechos mais parecidos
+  A-->>U: event: context
+  A->>G: chatStream(prompt com o contexto)
+  G-->>A: pedaços da resposta
+  A-->>U: event: token (vários) … event: done
+```

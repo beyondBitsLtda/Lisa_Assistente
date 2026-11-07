@@ -1,0 +1,2983 @@
+import { GoogleGenAI } from "@google/genai";
+import { TTS_VOICES } from "./ttsVoices.js";
+import { pickKeyIndex, markCooldown, markOk } from "./geminiKeyHealth.js";
+import { streamComRetomada } from "./retomada.js";
+import { limparTranscricao } from "./tomarNota.js";
+import { FORMAS, TIPOS, COLECOES, PONTAS, NOMES_DAS_CORES, estruturaQueCabe, TIPOS_DE_DESENHO, TIPOS_NO_PLANO } from "./diagramaDaLisa.js";
+
+const EMBED_MODEL = process.env.GEMINI_EMBED_MODEL || "gemini-embedding-001";
+// gemini-2.5-flash foi descontinuado pra projetos novos no Google Cloud (confirmado ao vivo:
+// erro 404 "no longer available to new users", recomendando este aqui) — projetos antigos
+// ainda tinham acesso legado ao 2.5, outros não. Testado e funcionando em várias chaves
+// antes de trocar o padrão.
+const CHAT_MODEL = process.env.GEMINI_CHAT_MODEL || "gemini-3.6-flash";
+const EMBED_DIM = Number(process.env.GEMINI_EMBED_DIM || 768);
+
+// ---- múltiplas chaves do Gemini — pool único, saúde rastreada por (chave × MODELO) ----
+// GEMINI_API_KEYS="chave1,chave2,...,chaveN" — cada chave precisa ser de um PROJETO
+// diferente no Google Cloud/AI Studio pra ter cota própria de verdade (chaves do MESMO
+// projeto compartilham a mesma cota, então trocar entre elas não ajuda em nada). Mantém
+// GEMINI_API_KEY funcionando sozinha se só houver uma.
+//
+// Todas as chaves são tratadas como IGUAIS no pool — não existe mais "prioritária vs
+// reserva" por POSIÇÃO na lista. Em vez disso, cada (chave × modelo) tem sua própria saúde
+// rastreada e persistida (ver geminiKeyHealth.js): uma chave pode estar ótima pro chat e
+// zerada pra voz ao mesmo tempo (cota é por modelo, não por chave só), e o estado sobrevive
+// entre invocações da função na Vercel (que não garante manter nada em memória). Isso
+// também resolve sozinho o velho problema de "AUTO-SYNC (embeddings) competindo com chat/
+// voz pela mesma chave": como a cota de EMBED_MODEL é rastreada separada da de CHAT_MODEL/
+// TTS_MODEL, uma chave exaurida de embeddings continua disponível pro chat na mesma hora.
+const KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "")
+  .split(",").map((k) => k.trim()).filter(Boolean);
+
+const _clients = new Map(); // chave → cliente (reaproveita entre chamadas)
+
+function clientFor(key) {
+  if (!_clients.has(key)) _clients.set(key, new GoogleGenAI({ apiKey: key }));
+  return _clients.get(key);
+}
+
+if (!KEYS.length) {
+  // não lança aqui (isso quebraria qualquer import deste módulo, inclusive em build) —
+  // só lança de verdade quando alguém tentar usar de fato, em withTransientRetry.
+}
+
+/** Rótulo de qual chave um índice representa — só pra diagnóstico em log (nunca expõe a
+ * chave em si, só a posição dela na lista, 1-based pra ficar legível). */
+function keyLabelFor(index) {
+  return `chave #${index + 1}`;
+}
+
+// ---- classifica o erro cru do Gemini — decide SE repete, e por QUANTO TEMPO a chave usada
+// deve ficar de cooldown pra este modelo específico ----
+// A API costuma devolver o corpo cru como uma string JSON aninhada e feia. Detectamos por
+// substring (robusto o bastante pro texto que a API realmente devolve).
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Quando a cota DIÁRIA volta a valer.
+ *
+ * Ela reinicia à meia-noite do Pacífico — o fuso das contas do Google —, não à nossa. Antes
+ * aqui havia meio dia fixo, com o comentário de que era "aproximação segura". Medido em
+ * 15/09/2026: as chaves esgotaram e ficaram trancadas até 06:20-07:40 da manhã seguinte,
+ * enquanto o Google já as aceitaria desde as 04:00. Quase três horas de silêncio por dia, sem
+ * motivo — e justamente nas horas em que a máquina está ociosa e poderia indexar.
+ *
+ * `Intl` com o nome do fuso resolve horário de verão sozinho; somar -7 ou -8 na mão erraria
+ * duas vezes por ano.
+ */
+function proximaViradaDaCotaDiaria(agora = Date.now()) {
+  const partes = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles", hour12: false,
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(new Date(agora)).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+  // `hour12: false` devolve "24" para meia-noite em algumas versões do ICU; o resto disso
+  // seria um cooldown negativo.
+  const decorrido = (Number(partes.hour) % 24) * 3600 + Number(partes.minute) * 60 + Number(partes.second);
+  return agora + (86_400 - decorrido) * 1000;
+}
+
+
+function classifyGeminiError(err) {
+  const msg = String(err?.message || err);
+
+  // Chamada que a GENTE cortou por demorar demais (ver o teto por tentativa em
+  // synthesizeSpeech). Precisa contar como transitória: se cair no caso geral lá embaixo,
+  // é tratada como erro definitivo, NÃO tenta outra chave, e o teto vira só uma forma mais
+  // rápida de falhar — o oposto do que ele existe pra fazer.
+  //
+  // Uma chave que pendurou uma vez costuma pendurar de novo em seguida, então ela sai de
+  // circulação por um minuto em vez dos 30s de uma sobrecarga comum.
+  if (err?.name === "AbortError" || /abort(ed)?/i.test(msg)) {
+    return { transient: true, code: "TIMEOUT", reason: "timeout", untilMs: Date.now() + 60_000 };
+  }
+
+  if (msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota") || /\b429\b/.test(msg)) {
+    // Google diz explicitamente no quotaId se o limite é DIÁRIO ("PerDay") ou por minuto —
+    // sem essa distinção, um cooldown fixo de 60s é curto demais pra cota diária (fica
+    // tentando de novo a cada minuto o dia inteiro à toa) e longo demais pra cota por minuto.
+    const isDaily = /PerDay/i.test(msg);
+    const retryMatch = msg.match(/retry in ([\d.]+)s/i);
+    return {
+      transient: true,
+      code: "QUOTA",
+      reason: isDaily ? "rpd" : "rpm",
+      untilMs: isDaily
+        ? proximaViradaDaCotaDiaria()
+        : Date.now() + (retryMatch ? Math.ceil(Number(retryMatch[1])) * 1000 + 2000 : 90_000),
+    };
+  }
+  if (msg.includes("UNAVAILABLE") || msg.includes("high demand") || /\b503\b/.test(msg)) {
+    return { transient: true, code: "UNAVAILABLE", reason: "overload", untilMs: Date.now() + 30_000 };
+  }
+  if (msg.includes("NOT_FOUND") || /"code":\s*404/.test(msg)) {
+    // modelo não existe/não está disponível NESTE projeto específico (ex.: descontinuado só
+    // pra contas novas) — outra chave/projeto pode muito bem ter acesso. Trata como "tenta
+    // outra chave" também, com cooldown bem longo (não é algo que se resolve sozinho em
+    // minutos — só mudando de modelo ou o Google revertendo a política).
+    return { transient: true, code: "UNSUPPORTED", reason: "unsupported", untilMs: Date.now() + 30 * DAY_MS };
+  }
+  return { transient: false };
+}
+
+function rewriteError(err, index, classified) {
+  const key = keyLabelFor(index);
+  if (classified.code === "QUOTA") {
+    const e = new Error(
+      `QUOTA_EXCEEDED: limite do Gemini atingido${classified.reason === "rpd" ? " (cota DIÁRIA)" : ""}. Aguarde e tente de novo.`
+    );
+    e.code = "QUOTA";
+    e.keyLabel = key;
+    return e;
+  }
+  if (classified.code === "TIMEOUT") {
+    const e = new Error("TIMEOUT: uma chave do Gemini travou e foi trocada por outra.");
+    e.code = "TIMEOUT";
+    e.keyLabel = key;
+    return e;
+  }
+  if (classified.code === "UNAVAILABLE") {
+    const e = new Error("UNAVAILABLE: o Gemini está com alta demanda no momento. Tente de novo em instantes.");
+    e.code = "UNAVAILABLE";
+    e.keyLabel = key;
+    return e;
+  }
+  if (classified.code === "UNSUPPORTED") {
+    const e = new Error("Esse modelo não está disponível numa das chaves configuradas (tentando outra automaticamente).");
+    e.code = "UNSUPPORTED";
+    e.keyLabel = key;
+    return e;
+  }
+  return err;
+}
+
+/**
+ * Executa `fn(client)` com retry, escolhendo uma chave diferente do pool a cada tentativa
+ * (evita repetir uma que já falhou NESTA MESMA chamada lógica) e respeitando o cooldown de
+ * cada (chave × `model`) — ver geminiKeyHealth.js. Em sucesso, limpa o cooldown dessa
+ * combinação (se houvesse). `computeDelay(attempt, err)` (opcional) sobrescreve o espaçamento
+ * padrão entre tentativas — usado por embedForIngest, que precisa respeitar um teto de
+ * espera bem mais curto (função da Vercel tem limite de 60s).
+ */
+/**
+ * MODELOS RESERVA DO CHAT — sobrecarga não é problema de chave.
+ *
+ * O Google responde 503 ("This model is currently experiencing high demand") quando o MODELO
+ * está sobrecarregado — para todo mundo, com qualquer chave. Antes, a resposta a isso era trocar
+ * de chave três vezes no mesmo modelo, pondo cada uma de castigo por 30s: num pico, as três
+ * falhavam juntas, o chat mostrava "alta demanda" e o painel de chaves ficava cheio de
+ * "sobrecarga" em chaves perfeitamente boas (visto em 09/10/2026: #1, #2 e #3).
+ *
+ * Agora, depois de duas sobrecargas no mesmo modelo, a chamada passa para o seguinte da lista.
+ * A sobrecarga também deixou de tirar a chave de circulação por 30s: fica só alguns segundos,
+ * o bastante para não insistir nela na mesma rajada e para aparecer no painel.
+ *
+ * Reservas escolhidas por medição: em 06/10, num pico, o 3.5-flash-lite foi o único "flash" que
+ * respondeu; em 09/10, com o 3.7 e o 3.8 sobrecarregados, o 3.5-flash e o 3.5-flash-lite
+ * responderam 4 de 4 em ~2s. Configurável em GEMINI_CHAT_RESERVAS (separadas por vírgula).
+ */
+const MODELOS_DE_CHAT = [...new Set([
+  CHAT_MODEL,
+  ...String(process.env.GEMINI_CHAT_RESERVAS || "gemini-3.5-flash,gemini-3.5-flash-lite")
+    .split(",").map((m) => m.trim()).filter(Boolean),
+])];
+const SOBRECARGAS_ANTES_DA_RESERVA = 2;
+const CASTIGO_DE_SOBRECARGA_MS = 5_000;
+
+/**
+ * O MODELO SOBRECARREGADO FICA LEMBRADO, E CADA TENTATIVA TEM TETO.
+ *
+ * Em 13/10/2026 o 3.6-flash e o 3.5-flash passaram a tarde em 503 em TODAS as 35 chaves, e
+ * algumas chamadas nem respondiam: ficavam penduradas mais de 25s. Como a abertura do stream
+ * não tinha teto, uma chamada pendurada travava a pergunta para sempre — a Lisa não mostrava
+ * texto, nem voz, nem erro. E cada pergunta nova repetia as mesmas tentativas no modelo caído
+ * antes de chegar ao lite, que respondia em menos de 1s.
+ *
+ * Agora: cada tentativa de chat tem TETO_DA_TENTATIVA_MS para começar a responder (estourou,
+ * conta como sobrecarga e passa para a próxima); e um modelo que esgotou as tentativas fica
+ * marcado por PAUSA_DO_MODELO_MS — as perguntas seguintes começam direto pela reserva. O último
+ * modelo da lista nunca é pulado: sem nenhum, a pergunta falharia sem nem tentar.
+ */
+const TETO_DA_TENTATIVA_MS = 12_000;
+const PAUSA_DO_MODELO_MS = 3 * 60_000;
+
+/**
+ * O TETO DE 12s É PARA COMEÇAR A RESPONDER — e só o chat começa cedo.
+ *
+ * No chat (streaming), 12s é o tempo para o PRIMEIRO pedaço chegar. Numa chamada sem streaming,
+ * o mesmo teto vale para a resposta INTEIRA — e a Lisa Code escrevendo um index.html, o plano
+ * de uma mudança de código ou o mapa de arquitetura levam bem mais que isso. Visto em 19/10/2026:
+ * toda edição grande da extensão estourava os 12s, contava como "sobrecarga", pausava o modelo
+ * do chat por 3 min e terminava em "UNAVAILABLE: alta demanda" — com 20 chaves livres no painel.
+ *
+ * As tarefas de resposta longa passam tetoMs: TETO_LONGO_MS. Estourar ESSE teto não pausa o
+ * modelo para os outros (a demora é da tarefa, não do Google) e o erro diz o que foi.
+ */
+const TETO_LONGO_MS = 75_000;
+// O desenho de várias abas com anotações longas e o .md de um desenho (01/11/2026: o "Fluxo de Uso MVP"
+// estourou os 75s): mais tempo. Duas tentativas por modelo, como o resto — com uma só, a "alta demanda"
+// de uma chave já derrubava o pedido (visto em 01/11/2026); depois vem o modelo de reserva.
+const TETO_DO_DESENHO_MS = 120_000;
+const modeloPausadoAte = new Map();
+
+/** Os modelos de chat na ordem em que vale tentar AGORA: os pausados vão para o fim. */
+export function modelosDeChatAgora(agora = Date.now()) {
+  const livres = MODELOS_DE_CHAT.filter((m) => !(modeloPausadoAte.get(m) > agora));
+  const pausados = MODELOS_DE_CHAT.filter((m) => modeloPausadoAte.get(m) > agora);
+  return [...livres, ...pausados];
+}
+
+/** Uma promessa com teto. Ao estourar, aborta a chamada (o `signal`) e rejeita com TETO. */
+function comTeto(promessa, controlador, ms) {
+  let relogio;
+  const teto = new Promise((_, rejeitar) => {
+    relogio = setTimeout(() => {
+      try { controlador.abort(); } catch { /* já terminou */ }
+      const e = new Error(`TETO: o modelo não começou a responder em ${ms / 1000}s`);
+      e.teto = true;
+      rejeitar(e);
+    }, ms);
+  });
+  return Promise.race([promessa, teto]).finally(() => clearTimeout(relogio));
+}
+
+async function withTransientRetry(model, fn, { attempts = 3, delayMs = 1200, computeDelay = null, paraIngestao = false, tetoMs = TETO_DA_TENTATIVA_MS } = {}) {
+  if (!KEYS.length) {
+    throw new Error(
+      "GEMINI_API_KEY (ou GEMINI_API_KEYS) não configurada. " +
+      "Defina em Vercel → Settings → Environment Variables (ou no .env local)."
+    );
+  }
+  // Só o chat tem reservas (e teto por tentativa); embeddings e o resto seguem no modelo pedido.
+  const ehChat = model === CHAT_MODEL;
+  const modelos = ehChat ? modelosDeChatAgora() : [model];
+  let ultimoErro;
+
+  for (let m = 0; m < modelos.length; m++) {
+    const modelo = modelos[m];
+    const haReserva = m < modelos.length - 1;
+    const tried = new Set();
+    let sobrecargas = 0;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const index = await pickKeyIndex(KEYS.length, modelo, tried, { paraIngestao });
+      tried.add(index);
+      const client = clientFor(KEYS[index]);
+      try {
+        const controlador = ehChat ? new AbortController() : null;
+        const result = ehChat
+          ? await comTeto(fn(client, modelo, controlador.signal), controlador, tetoMs)
+          : await fn(client, modelo);
+        await markOk(index, modelo);
+        modeloPausadoAte.delete(modelo);
+        return result;
+      } catch (err) {
+        // Teto estourado no chat: o MODELO não respondeu (com qualquer chave, como medido em
+        // 13/10) — conta como sobrecarga, sem castigar a chave por um minuto.
+        const classified = err?.teto
+          ? { transient: true, code: "UNAVAILABLE", reason: "timeout", untilMs: Date.now() + CASTIGO_DE_SOBRECARGA_MS }
+          : classifyGeminiError(err);
+        if (!classified.transient) throw err; // erro genuinamente não-transitório — não adianta repetir
+        const sobrecarga = classified.code === "UNAVAILABLE";
+        await markCooldown(index, modelo, {
+          untilMs: sobrecarga ? Date.now() + CASTIGO_DE_SOBRECARGA_MS : classified.untilMs,
+          reason: classified.reason,
+          error: err?.message || err,
+        });
+        ultimoErro = rewriteError(err, index, classified);
+        // Estourou o teto: o erro diz isso, e não "alta demanda" — são problemas diferentes.
+        if (err?.teto) {
+          ultimoErro = new Error(`TEMPO: o Gemini não terminou de responder em ${Math.round(tetoMs / 1000)}s (tentei outras chaves e modelos). Tente de novo, ou peça uma parte menor de cada vez.`);
+          ultimoErro.code = "TEMPO";
+          ultimoErro.keyLabel = keyLabelFor(index);
+        }
+        if (sobrecarga && ++sobrecargas >= SOBRECARGAS_ANTES_DA_RESERVA && haReserva) {
+          // Uma tarefa longa que demorou não é o modelo caído: não pausa o modelo do chat.
+          const demoraDaTarefa = err?.teto && tetoMs > TETO_DA_TENTATIVA_MS;
+          if (ehChat && !demoraDaTarefa) modeloPausadoAte.set(modelo, Date.now() + PAUSA_DO_MODELO_MS);
+          break; // próximo modelo
+        }
+        if (classified.code === "UNSUPPORTED" && haReserva) break; // modelo desligado neste projeto
+        if (attempt === attempts) break;
+        const wait = computeDelay ? computeDelay(attempt, err) : delayMs * attempt;
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
+  }
+  throw ultimoErro || new Error("withTransientRetry: unreachable");
+}
+
+/**
+ * Gera embeddings para um ou mais textos.
+ * taskType: "RETRIEVAL_DOCUMENT" ao indexar, "RETRIEVAL_QUERY" ao buscar.
+ * Retorna sempre um array de vetores (number[][]).
+ *
+ * Faz retry automático quando o Gemini devolve 429 (quota) ou 503 (alta demanda).
+ */
+export async function embed(texts, taskType = "RETRIEVAL_DOCUMENT") {
+  const contents = Array.isArray(texts) ? texts : [texts];
+  const res = await withTransientRetry(
+    EMBED_MODEL,
+    (client, modelo) => client.models.embedContent({ model: EMBED_MODEL, contents, config: { outputDimensionality: EMBED_DIM, taskType } }),
+    { attempts: 2, delayMs: 3000 } // menos tentativas e espera curta: falha rápido em vez de travar minutos
+  );
+  return res.embeddings.map((e) => e.values);
+}
+
+/** Conveniência: embedding de um único texto (number[]). */
+export async function embedOne(text, taskType = "RETRIEVAL_QUERY") {
+  const [v] = await embed(text, taskType);
+  return v;
+}
+
+/**
+ * Versão "paciente" do embed (mais tolerante que embed(), pra ingestão em lote), mas com
+ * paciência LIMITADA: cada chamada roda dentro de uma função da Vercel com teto de 60s
+ * (ver ingestSlice, src/lib/ingest/runSlice.js — usada tanto pelo botão SYNC manual quanto
+ * pelo tick automático), então esperar o tempo que o Gemini pedir (que pode passar de 30-60s
+ * sozinho) trava a função até ela ser morta no meio, sem nem registrar erro. Por isso a
+ * espera é sempre CURTA (teto de 8s) — se a cota não liberar rápido, desiste rápido também:
+ * quem chama (ingestSlice → /api/cron/sync) já tenta de novo no próximo tick, com uma
+ * chave diferente do pool, sem perder o offset onde parou.
+ */
+export async function embedForIngest(texts, taskType = "RETRIEVAL_DOCUMENT") {
+  const contents = Array.isArray(texts) ? texts : [texts];
+  const MAX_WAIT_SEC = 8;
+  // attempts:2 fazia sentido com poucas chaves, mas com o pool de 35 (e boa parte podendo
+  // estar de cooldown de cota diária ao mesmo tempo — visto na prática: 17 de 35 em cooldown
+  // de uma vez) só 2 tentativas às vezes esgotava em chaves ruins por azar do rodízio, MESMO
+  // com bastante chave livre sobrando no pool inteiro. Mais tentativas dá mais chance de cair
+  // numa disponível sem desistir cedo demais.
+  const res = await withTransientRetry(
+    EMBED_MODEL,
+    (client, modelo) => client.models.embedContent({ model: EMBED_MODEL, contents, config: { outputDimensionality: EMBED_DIM, taskType } }),
+    {
+      attempts: 4,
+      // A indexação fica restrita ao começo do pool; o fim é reserva da conversa (ver
+      // RESERVA_INTERATIVA em geminiKeyHealth.js). Sem esta linha, um ciclo de sync esgota a
+      // cota diária de TODAS as chaves de embedding e a próxima pergunta no chat espera 98s.
+      paraIngestao: true,
+      computeDelay: (attempt, err) => {
+        const msg = String(err?.message || err);
+        const m = msg.match(/retry in ([\d.]+)s/i);
+        return Math.min(m ? (Math.ceil(Number(m[1])) + 1) * 1000 : 5000 * attempt, MAX_WAIT_SEC * 1000);
+      },
+    }
+  );
+  return res.embeddings.map((e) => e.values);
+}
+
+/**
+ * Gera a resposta em streaming.
+ * Retorna um async iterator de pedaços de texto (string).
+ *
+ * `tools` (opcional) — ex.: [{ googleSearch: {} }] pra habilitar grounding com
+ * busca do Google (o modelo decide sozinho quando de fato buscar). Usado pelo
+ * modo "Geral" do assistente.
+ *
+ * `images` (opcional) — [{ mimeType, data (base64) }] — uma ou mais fotos tiradas na hora
+ * (Modo Observância = câmera, Modo Tela = captura de tela; ver assistant/page.js). Quando
+ * presente, vira multimodal: o mesmo modelo de chat também enxerga imagem, sem precisar de
+ * nenhum modelo/endpoint separado.
+ */
+export async function* chatStream(prompt, systemInstruction, { tools, images, aoMetadados } = {}) {
+  const config = {};
+  if (systemInstruction) config.systemInstruction = systemInstruction;
+  if (tools) config.tools = tools;
+
+  const contents = images?.length
+    ? [{ role: "user", parts: [{ text: prompt }, ...images.map((img) => ({ inlineData: { mimeType: img.mimeType, data: img.data } }))] }]
+    : prompt;
+
+  // retry na abertura do stream (withTransientRetry — 429/503 costumam se resolver em
+  // segundos) e retomada se ele quebrar no meio (streamComRetomada, ver retomada.js).
+  // `aoMetadados` (01/11/2026): recebe o groundingMetadata (as fontes da busca do Google) e o
+  // urlContextMetadata (as páginas lidas) que chegam junto dos pedaços — ver src/lib/buscaNaWeb.js
+  const abrir = async (c) => {
+    const stream = await withTransientRetry(CHAT_MODEL, (client, modelo, abortSignal) =>
+      client.models.generateContentStream({
+        model: modelo,
+        contents: c,
+        config: { ...config, ...(abortSignal ? { abortSignal } : {}) },
+      })
+    );
+    if (!aoMetadados) return stream;
+    return (async function* () {
+      for await (const chunk of stream) {
+        const candidato = chunk?.candidates?.[0];
+        if (candidato?.groundingMetadata) aoMetadados(candidato.groundingMetadata);
+        if (candidato?.urlContextMetadata) aoMetadados(candidato.urlContextMetadata);
+        yield chunk;
+      }
+    })();
+  };
+  yield* streamComRetomada(abrir, contents);
+}
+
+/**
+ * Detecta se a mensagem do usuário é um PEDIDO DE AÇÃO sobre um card do Trello mencionado
+ * recentemente (mudar prazo, mover de lista, marcar concluído), a ESCOLHA de qual card entre
+ * várias opções apresentadas, ou uma confirmação/cancelamento de uma ação já proposta — usado
+ * só no contexto de boards do Trello no Assistente (ver src/lib/assistantActions.js e
+ * /api/ask). Chamada separada e SEM streaming — pequena e rápida, decide antes de montar a
+ * resposta conversacional normal.
+ *
+ * Retorna { intent: "none" } se não for nada disso (o caminho mais comum, de longe).
+ */
+export async function detectTrelloAction({ question, todayLabel, candidateCards = [], pendingAction = null }) {
+  const cardsBlock = candidateCards.length
+    ? candidateCards
+        .map((c) => `- id=${c.id} · "${c.title}" · board="${c.board}" · lista="${c.list || "—"}" · prazo=${c.due || "sem prazo"} · concluído=${c.due_complete}`)
+        .join("\n")
+    : "(nenhum card no contexto recente)";
+
+  let pendingBlock = "Não há nenhuma ação pendente no momento.";
+  if (pendingAction?.type === "clarify") {
+    const numbered = pendingAction.candidates.map((c, i) => `  ${i + 1}. id=${c.card_id} · "${c.title}" (${c.board})`).join("\n");
+    pendingBlock = `Você acabou de perguntar QUAL desses cards o usuário quer mudar (campo "${pendingAction.field}" → "${pendingAction.new_value}"):\n${numbered}`;
+  } else if (pendingAction?.type === "confirm") {
+    pendingBlock = `Existe uma AÇÃO PENDENTE de confirmação: ${JSON.stringify(pendingAction)}`;
+  }
+
+  const prompt = `Hoje é ${todayLabel}.
+
+CARDS DO TRELLO MENCIONADOS RECENTEMENTE (candidatos pra ação):
+${cardsBlock}
+
+${pendingBlock}
+
+MENSAGEM DO USUÁRIO:
+"${question}"
+
+Decida a intenção do usuário e responda SOMENTE com o JSON pedido.`;
+
+  const systemInstruction = `Você identifica se uma mensagem é um PEDIDO DE AÇÃO sobre um card do Trello
+listado acima (mudar prazo, mover de lista, marcar concluído/reabrir), a ESCOLHA de qual card
+entre opções que você acabou de listar, uma CONFIRMAÇÃO/CANCELAMENTO de uma ação pendente, ou
+nenhuma das anteriores (uma pergunta normal).
+
+O usuário quase nunca vai citar o nome EXATO do card — ele se refere de forma natural ("aquela
+tarefa que venceu ontem", "a do site da Criativa", "essa aí"). Use o contexto da conversa (o
+que foi discutido, prazos, boards) pra achar o(s) card(s) mais prováveis nos candidatos acima.
+Prefira AGIR (propose_action ou clarify_candidates) a cair em "none" sempre que o pedido for
+claramente uma ação sobre algo que aparece nos candidatos, mesmo que a referência seja vaga.
+
+Regras:
+- "propose_action": você tem UM candidato claramente mais provável que os outros pro que foi
+  pedido. Escolha o card_id. Pra "due", calcule a data real em ISO 8601 (AAAA-MM-DD) a partir
+  de hoje e da instrução (ex.: "amanhã" = hoje+1 dia); pra remover o prazo, new_value = "". Pra
+  "list", new_value é o NOME da lista de destino tal como o usuário disse (não precisa ser
+  exato). Pra "due_complete", new_value é "true" ou "false".
+- "clarify_candidates": DOIS OU MAIS candidatos combinam igualmente bem com o pedido, e você
+  não tem como saber qual sem perguntar. Preencha field/new_value (a ação já está clara, só
+  falta o card) e candidate_ids com os 2 a 4 ids mais prováveis, em ordem de probabilidade.
+- "select_candidate": só quando o bloco acima mostrar que você JÁ perguntou qual card (lista
+  numerada) — o usuário está respondendo qual é (por número, "a primeira/segunda", ou citando
+  algo do card). Devolva o card_id escolhido dessa lista.
+- "confirm_pending" / "cancel_pending": só quando já existir uma ação pendente do tipo
+  "confirm" (não "clarify") E a mensagem claramente concorda ("sim", "confirma", "pode",
+  "manda", "isso") ou recusa ("não", "cancela", "espera", "deixa quieto").
+- "none": só quando genuinamente não for nada disso, ou nenhum candidato tiver relação alguma
+  com o pedido. Não use "none" só por a referência ao card ser indireta — tente resolver pelo
+  contexto primeiro.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              intent: {
+                type: "STRING",
+                enum: ["none", "propose_action", "clarify_candidates", "select_candidate", "confirm_pending", "cancel_pending"],
+              },
+              card_id: { type: "STRING" },
+              field: { type: "STRING", enum: ["due", "list", "due_complete"] },
+              new_value: { type: "STRING" },
+              candidate_ids: { type: "ARRAY", items: { type: "STRING" } },
+            },
+            required: ["intent"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 800 }
+  );
+
+  try {
+    const parsed = JSON.parse(res.text);
+    return parsed && typeof parsed === "object" ? parsed : { intent: "none" };
+  } catch {
+    return { intent: "none" };
+  }
+}
+
+/**
+ * Entende um pedido de AÇÃO nos cards do Abacato (out/2026): criar, editar, concluir,
+ * reabrir, mover ou arquivar — ou a resposta a uma ação que ela já propôs. Chamada separada,
+ * sem streaming, antes da resposta normal. Ver src/lib/acoesNoAbacato.js (regras) e
+ * src/lib/abacatoAcoes.js (gravação).
+ *
+ * `ultimaResposta` é a última fala inteira da Lisa: "cria um card com esse texto que você
+ * sugeriu" precisa dela — o modelo devolve usar_ultima_resposta e o servidor cola o texto.
+ *
+ * "Cria um card com um pitch de vendas" é OUTRA coisa: pede um texto que ainda não existe. Antes
+ * só havia as duas saídas acima, e o modelo colou a última resposta (sobre outro assunto) na
+ * descrição — visto em 16/10/2026. Agora ele devolve escrever_descricao com o que redigir, e o
+ * card vira um RASCUNHO montado na conversa (conduzirRascunho, logo abaixo). "Me ajuda a montar
+ * um card" também abre o rascunho (elaborar=true).
+ */
+export async function detectarAcaoNoAbacato({ pergunta, hoje, conversa = "", ultimaResposta = "", candidatos = [], quadros = [], quadroPadrao = null, pendente = null }) {
+  const blocoCards = candidatos.length
+    ? candidatos.map((c) => `- id=${c.id} · "${c.title}" · quadro="${c.board || "—"}" · coluna="${c.list || "—"}" · prazo=${c.due || "sem prazo"} · concluído=${c.due_complete ? "sim" : "não"}`).join("\n")
+    : "(nenhum card candidato)";
+  const blocoQuadros = quadros.length
+    ? quadros.map((q) => `- quadro "${q.nome}" (id=${q.id}): ${q.colunas.map((c) => `"${c.nome}" (coluna_id=${c.id})`).join(", ") || "sem colunas"}`).join("\n")
+    : "(nenhum quadro)";
+  let blocoPendente = "Não há nenhuma ação pendente.";
+  if (pendente?.type === "abacato") blocoPendente = `Você PROPÔS esta ação e está esperando o "sim" do usuário: ${JSON.stringify(pendente)}`;
+  else if (pendente?.type === "abacato_escolha") {
+    blocoPendente = `Você PERGUNTOU qual destes cards o usuário quer (ação "${pendente.acao}"):\n${pendente.candidatos.map((c, i) => `  ${i + 1}. id=${c.id} · "${c.titulo}" (${c.quadro})`).join("\n")}`;
+  }
+
+  const prompt = `DATA DE HOJE: ${hoje}
+
+QUADRO PADRÃO (o que está aberto no Assistente, use se o usuário não disser outro): ${quadroPadrao || "nenhum"}
+
+QUADROS E COLUNAS DO ABACATO:
+${blocoQuadros}
+
+CARDS CANDIDATOS (da conversa recente e com título parecido com o pedido):
+${blocoCards}
+
+CONVERSA ATÉ AGORA:
+${conversa || "(sem conversa anterior)"}
+
+ÚLTIMA RESPOSTA INTEIRA DA LISA:
+${ultimaResposta ? ultimaResposta.slice(0, 3000) : "(nenhuma)"}
+
+AÇÃO PENDENTE:
+${blocoPendente}
+
+MENSAGEM DO USUÁRIO:
+${pergunta}`;
+
+  const systemInstruction = `Você é o módulo de AÇÕES da Lisa no Abacato, o sistema de tarefas do usuário (quadros, colunas e cards).
+A Lisa PODE criar, editar, concluir, reabrir, mover e excluir (arquivar) cards. Decida se a mensagem é
+um pedido desses, ou a resposta a uma ação já proposta, e devolva o JSON.
+
+intent:
+- "propor": o usuário pediu uma ação e você tem o necessário. Preencha "acao" e:
+  • criar: coluna_id (do quadro que o usuário citou; se não citou, do QUADRO PADRÃO; sem nada, o
+    primeiro quadro), titulo curto e claro (até ~80 caracteres), prazo se houver, e SEMPRE
+    origem_da_descricao — de onde vem o texto do card:
+      "nenhuma": tarefa simples, que o título já diz tudo ("cria um card de ligar para o
+         contador amanhã às 10h" → titulo "Ligar para o contador" e prazo do dia seguinte às
+         10:00; "anota: comprar toner"; "card para revisar o site sexta" → prazo da sexta);
+      "ditada": o usuário ditou o texto ("com a descrição: ligar às 10h") → copie em descricao;
+      "escrever": o card precisa de um CONTEÚDO que VOCÊ tem que produzir — um texto, uma
+         estrutura, um plano, uma lista, um passo a passo, ideias, sugestões, uma análise, um
+         roteiro, um modelo. Sinais: "com um pitch / e-mail / roteiro / proposta / post / plano /
+         estrutura / lista / checklist / ideias", "o que você acha ideal", "a estrutura que você
+         recomenda", "sugira", "monte", "elabore", "descrevendo", "detalhando", "explicando",
+         "seção por seção", "item por item". Ex.: "cria um card com a estrutura que você acha
+         ideal pro perfil da Acme no GitHub, descrevendo seção por seção" → "escrever": o
+         assunto vai no título e o CONTEÚDO (a estrutura, seção por seção) é o que o card leva.
+         NÃO escreva nada em descricao; ponha em escrever_descricao o que deve ser escrito, com
+         todos os detalhes que ele deu (assunto, seções, público, tom, tamanho). O texto é
+         montado depois, conversando com ele;
+      "ultima_resposta": o usuário se refere a um texto que a Lisa JÁ escreveu nesta conversa
+         ("esse texto", "o e-mail que você fez", "o que você acabou de falar") E a ÚLTIMA
+         RESPOSTA é esse texto → marque também usar_ultima_resposta=true e NÃO copie em descricao.
+    O erro mais caro é criar um card VAZIO quando ele pediu um conteúdo: se o pedido descreve o
+    que o card deve CONTER além do assunto, não é "nenhuma". Na dúvida entre "escrever" e
+    "ultima_resposta", é "escrever". Nunca use a última resposta só porque ela existe: se ela
+    fala de outro assunto, ela não entra no card. Invente sempre um titulo curto a partir do assunto.
+    Se ele quer montar o card COM você, conversando ("me ajuda a montar um card", "vamos elaborar
+    um card de...", "quero criar um card, me pergunta o que precisa"), marque elaborar=true (o
+    titulo pode ser provisório).
+  • editar: card_id e só os campos que mudam (titulo, descricao e/ou prazo). prazo="remover" tira o
+    prazo. A descrição segue as mesmas regras de criar (origem_da_descricao: "nenhuma" se o texto
+    não muda), e "vamos melhorar o texto do card X" também é elaborar=true.
+  • concluir / reabrir / arquivar: card_id.
+  • mover: card_id e coluna_id de destino (mesmo quadro do card).
+  prazo: "AAAA-MM-DD", ou "AAAA-MM-DDTHH:MM" se o usuário disse a hora, calculado a partir de hoje
+  ("amanhã", "sexta", "dia 20"). Se a mensagem cita QUALQUER data ou hora para o card, preencha
+  prazo — em qualquer origem_da_descricao; esquecer o prazo é perder o que ele pediu. "excluir", "apagar", "remover o card", "tirar do quadro" = arquivar.
+  "marcar como feito", "finalizei", "terminei" = concluir.
+- "esclarecer": a ação está clara mas DOIS ou mais cards combinam igualmente. Preencha acao, os
+  campos que mudam e candidatos_ids (2 a 4, do mais provável ao menos).
+- "selecionar": há uma pergunta "qual card" pendente e o usuário escolheu (número, posição ou nome).
+  Devolva card_id.
+- "confirmar" / "cancelar": há uma ação pendente proposta e o usuário concordou ou recusou.
+- "nenhuma": não é pedido de ação (perguntas, conversa, "quais tarefas tenho") ou não há card
+  algum que combine. Na dúvida entre ler e mudar, é "nenhuma".
+Use só ids que aparecem acima. Nunca invente ids.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo, abortSignal) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              intent: { type: "STRING", enum: ["nenhuma", "propor", "esclarecer", "selecionar", "confirmar", "cancelar"] },
+              acao: { type: "STRING", enum: ["criar", "editar", "concluir", "reabrir", "mover", "arquivar"] },
+              card_id: { type: "STRING" },
+              coluna_id: { type: "STRING" },
+              titulo: { type: "STRING" },
+              descricao: { type: "STRING" },
+              prazo: { type: "STRING", description: "AAAA-MM-DD ou AAAA-MM-DDTHH:MM sempre que a mensagem citar data ou hora (amanhã, sexta, dia 20, às 10h); 'remover' tira o prazo" },
+              usar_ultima_resposta: { type: "BOOLEAN" },
+              // obrigatório: decidir de onde vem o texto. Opcional, o modelo nunca marcava
+              // escrever_descricao e "cria um card com a estrutura que você acha ideal…" virava
+              // um card vazio, só com o título (8 de 8 no teste de 21/10/2026)
+              origem_da_descricao: { type: "STRING", enum: ["nenhuma", "ditada", "escrever", "ultima_resposta"] },
+              escrever_descricao: { type: "STRING" },
+              elaborar: { type: "BOOLEAN" },
+              candidatos_ids: { type: "ARRAY", items: { type: "STRING" } },
+            },
+            required: ["intent", "origem_da_descricao"],
+            propertyOrdering: ["intent", "acao", "card_id", "coluna_id", "titulo", "prazo", "origem_da_descricao", "descricao", "escrever_descricao", "usar_ultima_resposta", "elaborar", "candidatos_ids"],
+          },
+          ...(abortSignal ? { abortSignal } : {}),
+        },
+      }),
+    { attempts: 2, delayMs: 800 }
+  );
+
+  try {
+    const r = JSON.parse(res.text);
+    return r && typeof r === "object" ? r : { intent: "nenhuma" };
+  } catch {
+    return { intent: "nenhuma" };
+  }
+}
+
+/**
+ * Conduz o RASCUNHO de um card — o card montado conversando (ver acoesNoAbacato.js). A cada
+ * mensagem decide: perguntar o que falta, atualizar o texto, gravar (aprovado), desistir, ou
+ * "fora" (a mensagem é outro assunto; o rascunho fica guardado). Escreve com o que a Lisa sabe
+ * (`contexto`: trechos do índice — quadros e Cérebro).
+ */
+export async function conduzirRascunho({ rascunho, mensagem, conversa = "", contexto = [], quadros = [], hoje = "" }) {
+  const r = rascunho;
+  const blocoContexto = contexto.length
+    ? contexto.map((m, i) => `[#${i + 1} · ${m.source} · ${m.board}] ${m.title}\n${String(m.content || "").slice(0, 1500)}`).join("\n\n---\n\n")
+    : "(nada encontrado no índice)";
+  const blocoQuadros = quadros.length
+    ? quadros.map((q) => `- quadro "${q.nome}": ${q.colunas.map((c) => `"${c.nome}" (coluna_id=${c.id})`).join(", ") || "sem colunas"}`).join("\n")
+    : "(nenhum quadro)";
+  const prompt = `DATA DE HOJE: ${hoje}
+
+O PEDIDO QUE ABRIU O RASCUNHO:
+${r.pedido || "(não registrado)"}
+
+RASCUNHO ATUAL (${r.acao === "criar" ? "card novo" : `editando o card "${r.card_titulo || ""}"`}; rodadas de conversa até agora: ${r.rodadas}):
+Título: ${r.titulo || "(sem título ainda)"}
+${r.acao === "criar" ? `Onde: ${r.destino || "(não definido)"}\n` : ""}Prazo: ${r.prazo || "(sem prazo)"}
+Descrição:
+${r.descricao || "(ainda sem texto)"}
+
+QUADROS E COLUNAS DO ABACATO:
+${blocoQuadros}
+
+O QUE A LISA SABE SOBRE O ASSUNTO (quadros e notas do usuário):
+${blocoContexto}
+
+CONVERSA ATÉ AGORA:
+${conversa || "(sem conversa anterior)"}
+
+MENSAGEM DO USUÁRIO:
+${mensagem}`;
+
+  const systemInstruction = `Você é a Lisa montando um card do Abacato JUNTO com o usuário, numa conversa por texto
+ou por voz. O card só é gravado quando ele aprovar. A cada mensagem dele, escolha o intent:
+
+- "perguntar": falta informação que muda o texto (para quem é, objetivo, o que destacar, tom,
+  tamanho, prazo). Faça de 1 a 3 perguntas curtas, numa fala natural. Não pergunte o que dá para
+  deduzir do contexto ou da conversa. Não mexa no rascunho.
+- "atualizar": já dá para escrever, ele respondeu suas perguntas, ou pediu uma mudança. Devolva SÓ
+  os campos que mudaram: descricao sempre INTEIRA (o texto completo novo, não só o trecho mudado),
+  prazo ("AAAA-MM-DD", ou "AAAA-MM-DDTHH:MM" com hora; "remover" tira o prazo), coluna_id (só ids
+  da lista, e só em card novo) e titulo — este SÓ se ele pedir outro título ou se ainda não houver
+  um: curto (até 80 caracteres), sem data, sem nome de cliente que ele não citou. Em fala: 1 ou 2 frases dizendo o que você fez e, se valer,
+  UMA sugestão ou pergunta para melhorar; termine perguntando se quer mudar mais algo ou se pode
+  ${r.acao === "criar" ? "criar" : "salvar"}.
+- "concluir": ele aprovou ("pode criar", "tá ótimo", "salva", "manda", "isso, cria"). Se na mesma
+  mensagem ele pedir mais um ajuste, é "atualizar". fala vazia.
+- "cancelar": ele desistiu do card ("esquece o card", "deixa pra lá", "cancela").
+- "fora": a mensagem não tem a ver com o card (outra pergunta, outro assunto). fala vazia.
+
+Regras:
+- Primeira mensagem (rodadas 0, sem texto): pedido vago para um bom texto → perguntar; se já dá
+  para escrever bem → atualizar com a primeira versão. Se ele pediu a SUA proposta ("o que você
+  acha ideal", "a estrutura que você recomenda", "sugira", "monte", "descrevendo seção por
+  seção"), escreva a primeira versão completa já (atualizar), sem perguntar antes: ele quer ver
+  o que você propõe para ajustar em cima. Depois de 2 rodadas de perguntas sem texto,
+  escreva uma versão com o que tiver.
+- Rascunho com "(ainda sem texto)": todo "atualizar" traz o campo descricao com o texto do card.
+  Dizer na fala que escreveu e não mandar o texto deixa o card vazio na tela.
+- Mensagem com VÁRIOS pedidos ("deixa mais curto e põe prazo sexta"): aplique TODOS no mesmo
+  "atualizar" — o texto novo em descricao E o prazo. Fazer só um deles é ignorar o que ele pediu.
+- Cada campo do JSON contém só o valor final: nada de comentário, dúvida ou raciocínio dentro dele.
+- "não" ou "sem prazo" respondendo a uma pergunta sua é resposta, não cancelamento.
+- Fatos só do contexto e da conversa. O que faltar vira marcador entre colchetes, como [preço].
+- O texto do card: português do Brasil, texto puro (sem #, sem **), parágrafos curtos, listas com
+  "- " quando ajudarem. Sem "Claro!" nem comentário sobre o pedido dentro do texto.
+- Card de tarefa simples (não pede texto): a descrição pode ficar curta ou vazia.
+- A fala é lida em voz alta: frases curtas, sem listas, e sem repetir o texto do card (ele aparece
+  na tela). Se ele pedir para ouvir o texto ("lê pra mim como ficou"), use "perguntar" e ponha o
+  texto na fala.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo, abortSignal) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              intent: { type: "STRING", enum: ["perguntar", "atualizar", "concluir", "cancelar", "fora"] },
+              fala: { type: "STRING" },
+              titulo: { type: "STRING" },
+              descricao: { type: "STRING" },
+              prazo: { type: "STRING" },
+              coluna_id: { type: "STRING" },
+            },
+            required: ["intent", "fala"], // sem fala, o ajuste vinha mudo ("Ajustei.")
+          },
+          ...(abortSignal ? { abortSignal } : {}),
+        },
+      }),
+    { attempts: 2, delayMs: 800 }
+  );
+  try {
+    const d = JSON.parse(res.text);
+    if (!d || typeof d !== "object") return { intent: "fora" };
+    if (typeof d.descricao === "string") d.descricao = d.descricao.replace(/\*\*/g, "").trim();
+    return d;
+  } catch {
+    return { intent: "fora" };
+  }
+}
+
+/**
+ * Decide quais arquivos são relevantes pra um pedido só pelos NOMES/CAMINHOS deles (sem ver
+ * conteúdo ainda) — complementa a busca semântica (que falha em pedidos amplos tipo "mude o
+ * tema", já que arquivo de config não se parece textualmente com o pedido). Chamada leve e
+ * barata (só texto, sem embedding), usada por runCodeTask(Streaming) em codeTasks.js ANTES
+ * de buscar o conteúdo de verdade — assim a Lisa "entende sozinha" que precisa desses
+ * arquivos, sem o usuário precisar marcar manualmente.
+ */
+export async function selectRelevantFiles({ instruction, filePaths = [], repo }) {
+  if (!filePaths.length) return [];
+  const prompt = `Repositório: ${repo}
+
+LISTA DE ARQUIVOS DO REPOSITÓRIO (só os caminhos — você ainda não viu o conteúdo deles):
+${filePaths.join("\n")}
+
+PEDIDO DO USUÁRIO:
+"${instruction}"
+
+Pelos NOMES/CAMINHOS acima, quais arquivos são mais prováveis de precisar mudar ou servir de
+referência pra atender esse pedido? Pense em convenções comuns de projeto (ex.: pedido sobre
+"tema"/"cor"/"visual" costuma envolver arquivos com nome tipo theme, color, palette, style,
+css, config, globals). Devolva só os que você tem motivo real pra achar relevantes — no
+máximo uns 6, em ordem de confiança.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: {
+          systemInstruction: "Você ajuda a decidir quais arquivos de um repositório são relevantes pra um pedido, só pelos nomes/caminhos dos arquivos, sem ver o conteúdo.",
+          responseMimeType: "application/json",
+          responseSchema: { type: "OBJECT", properties: { paths: { type: "ARRAY", items: { type: "STRING" } } }, required: ["paths"] },
+        },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+
+  try {
+    const parsed = JSON.parse(res.text);
+    const valid = new Set(filePaths); // nunca confia cegamente — só aceita caminho que existe de verdade
+    return (parsed.paths || []).filter((p) => valid.has(p)).slice(0, 6);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Os arquivos que a Lisa lê de um repositório VINCULADO à conversa (25/10/2026 — ver
+ * src/lib/repositorioNaConversa.js), escolhidos pelos caminhos E pelo que ela vê: as imagens
+ * (a tela no Modo Tela, a câmera, os prints anexados) vão junto, para ela achar na árvore o
+ * arquivo que aparece na tela. `repos`: [{ repo, caminhos }]. Devolve [{ repo, path }].
+ */
+export async function escolherArquivosDaConversa({ pergunta, conversa = "", repos = [], imagens = [], max = 8 }) {
+  const comCaminhos = repos.filter((r) => r.caminhos?.length);
+  if (!comCaminhos.length) return [];
+  const prompt = `REPOSITÓRIOS VINCULADOS À CONVERSA (só os caminhos dos arquivos — o conteúdo vem depois):
+${comCaminhos.map((r) => `### ${r.repo}\n${r.caminhos.join("\n")}`).join("\n\n")}
+${conversa ? `\nA CONVERSA ATÉ AGORA:\n${conversa}\n` : ""}
+PERGUNTA DO USUÁRIO:
+"${pergunta}"
+${imagens.length ? `\nHá ${imagens.length} imagem(ns) anexada(s): a tela do computador do usuário, a câmera e/ou prints que ele colou. Se mostrarem código, um erro, uma tela do sistema ou um nome de arquivo, ache na lista acima o(s) arquivo(s) de onde isso vem — é o mais importante.\n` : ""}
+Quais arquivos a Lisa precisa LER para responder bem? Pense: o que aparece nas imagens, o que a
+pergunta cita (nomes, telas, rotas, funções, erros), os arquivos que esses usam ou que os usam, e
+os de configuração quando o assunto pedir. No máximo ${max}, do mais importante para o menos.
+Devolva cada um com o repositório e o caminho exatamente como estão na lista.`;
+
+  const conteudo = imagens.length
+    ? [{ role: "user", parts: [{ text: prompt }, ...imagens.map((img) => ({ inlineData: { mimeType: img.mimeType, data: img.data } }))] }]
+    : prompt;
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: conteudo,
+        config: {
+          systemInstruction: "Você escolhe quais arquivos de repositórios de código precisam ser lidos para responder a uma pergunta, pelos caminhos dos arquivos e pelo que aparece nas imagens anexadas.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              arquivos: { type: "ARRAY", items: { type: "OBJECT", properties: { repo: { type: "STRING" }, path: { type: "STRING" } }, required: ["repo", "path"] } },
+            },
+            required: ["arquivos"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+
+  try {
+    const parsed = JSON.parse(res.text);
+    // nunca confia cegamente — só aceita caminho que existe de verdade naquele repositório
+    const validos = new Map(comCaminhos.map((r) => [r.repo.toLowerCase(), new Set(r.caminhos)]));
+    const vistos = new Set();
+    const saida = [];
+    for (const a of parsed.arquivos || []) {
+      const repo = comCaminhos.find((r) => r.repo.toLowerCase() === String(a.repo || "").toLowerCase())?.repo;
+      if (!repo || !validos.get(repo.toLowerCase())?.has(a.path) || vistos.has(`${repo}:${a.path}`)) continue;
+      vistos.add(`${repo}:${a.path}`);
+      saida.push({ repo, path: a.path });
+      if (saida.length >= max) break;
+    }
+    return saida;
+  } catch {
+    return [];
+  }
+}
+
+// ---- Tarefas de código: a Lisa PROPÕE mudança de arquivo (nunca aplica sozinha — ver
+// src/lib/codeTasks.js, que cria a branch/commit/PR a partir disto) ----
+export async function planCodeChanges({ instruction, contextFiles = [], repo }) {
+  const filesBlock = contextFiles.length
+    ? contextFiles.map((f) => `--- ${f.path} ---\n${f.content}`).join("\n\n")
+    : "(nenhum arquivo de contexto encontrado — proponha só se tiver certeza do que fazer, ou devolva files vazio)";
+
+  const prompt = `Repositório: ${repo}
+
+ARQUIVOS RELEVANTES ENCONTRADOS (conteúdo COMPLETO e ATUAL de cada um):
+${filesBlock}
+
+PEDIDO DO USUÁRIO:
+"${instruction}"
+
+Proponha as mudanças de arquivo necessárias pra atender esse pedido.`;
+
+  const systemInstruction = `Você é a Lisa, propondo uma mudança de código que vai virar um Pull Request pro
+usuário revisar — ele NUNCA vê o código sendo aplicado direto, só o PR resultante, então a
+proposta precisa estar certa e completa.
+
+Regras estritas:
+- Para CADA arquivo que precisar mudar, devolva o CONTEÚDO COMPLETO do arquivo depois da
+  mudança — nunca um trecho, diff, ou só a parte alterada. Se o arquivo já existia no
+  contexto acima, parta exatamente dele e aplique só a mudança pedida, preservando todo o
+  resto igual (comentários, formatação, imports não relacionados).
+- Só inclua no resultado os arquivos que REALMENTE precisam mudar. Não "aproveite" pra
+  refatorar ou mudar estilo em código não relacionado ao pedido.
+- Se o pedido exigir um arquivo novo que não está no contexto, pode criar (path novo).
+- Se o contexto disponível não for suficiente pra ter certeza do que fazer com segurança,
+  devolva "files" vazio e explique o motivo em "unable_reason" — é preferível não propor nada
+  a propor algo errado que vira um PR ruim.
+- "summary": 1-2 frases, em português, resumindo a mudança — vira o título/corpo do PR.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              summary: { type: "STRING" },
+              unable_reason: { type: "STRING" },
+              files: {
+                type: "ARRAY",
+                items: {
+                  type: "OBJECT",
+                  properties: { path: { type: "STRING" }, content: { type: "STRING" } },
+                  required: ["path", "content"],
+                },
+              },
+            },
+            required: ["summary", "files"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_LONGO_MS }
+  );
+
+  try {
+    const parsed = JSON.parse(res.text);
+    return { summary: "", unable_reason: null, files: [], ...parsed };
+  } catch {
+    return { summary: "", unable_reason: "resposta do Gemini não veio em JSON válido", files: [] };
+  }
+}
+
+/**
+ * FASE 1 de 2 do "Modo Código" em streaming (ver src/lib/codeTasks.js:runCodeTaskStreaming).
+ * Decide só QUAIS arquivos precisam mudar (não o conteúdo ainda) — call rápida porque a
+ * SAÍDA é pequena (uma lista de caminhos + um resumo), mesmo lendo bastante contexto de
+ * entrada. Existe separada da geração de conteúdo (fase 2, streamSingleFileChange) porque
+ * juntar as duas numa chamada só — decidir E escrever o conteúdo completo de vários
+ * arquivos de uma vez — ficava lenta demais e estourava o teto de 60s da função da Vercel
+ * em pedidos que tocam mais de 1-2 arquivos.
+ */
+export async function planFilesToEdit({ instruction, contextFiles = [], repo }) {
+  const filesBlock = contextFiles.length
+    ? contextFiles.map((f) => `--- ${f.path} ---\n${f.content}`).join("\n\n")
+    : "(nenhum arquivo de contexto encontrado)";
+
+  const prompt = `Repositório: ${repo}
+
+ARQUIVOS RELEVANTES ENCONTRADOS (conteúdo COMPLETO e ATUAL de cada um):
+${filesBlock}
+
+PEDIDO DO USUÁRIO:
+"${instruction}"
+
+Decida quais desses arquivos REALMENTE precisam mudar pra atender o pedido (não escreva o
+conteúdo ainda, só decida QUAIS).`;
+
+  const systemInstruction = `Você é a Lisa, decidindo quais arquivos precisam mudar pra atender um pedido de código —
+o conteúdo de cada um será escrito depois, numa etapa separada.
+
+Regras:
+- Só inclua arquivos que REALMENTE precisam mudar — não aproveite pra "sugerir" mudar
+  arquivo não relacionado ao pedido.
+- Pode incluir um caminho de arquivo NOVO (que não estava no contexto) se o pedido exigir
+  criar algo que ainda não existe.
+- Se o contexto não for suficiente pra ter certeza do que fazer com segurança, devolva
+  "paths" vazio e explique o motivo em "unable_reason" — melhor não propor nada do que
+  propor errado.
+- "summary": 1-2 frases em português resumindo a mudança que vai ser feita.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              summary: { type: "STRING" },
+              unable_reason: { type: "STRING" },
+              paths: { type: "ARRAY", items: { type: "STRING" } },
+            },
+            required: ["summary", "paths"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 600, tetoMs: TETO_LONGO_MS }
+  );
+
+  try {
+    const parsed = JSON.parse(res.text);
+    return { summary: "", unable_reason: null, paths: [], ...parsed };
+  } catch {
+    return { summary: "", unable_reason: "resposta do Gemini não veio em JSON válido", paths: [] };
+  }
+}
+
+/**
+ * FASE 2 de 2 — gera o conteúdo COMPLETO de UM ÚNICO arquivo, em streaming. Chamada uma vez
+ * por arquivo (ver runCodeTaskStreaming) — input e output pequenos (só esse arquivo, não
+ * todos juntos), o que é o que mantém cada chamada rápida o bastante pra caber nos 60s da
+ * função mesmo quando a tarefa toca vários arquivos.
+ *
+ * `siblingChanges` (opcional) — os OUTROS arquivos já reescritos NESTA MESMA tarefa (path +
+ * conteúdo novo) — sem isso, cada arquivo era gerado no escuro em relação aos demais, podendo
+ * ficar inconsistente (ex.: renomear uma função no arquivo A sem atualizar quem a chama no
+ * arquivo B, gerado logo depois). Mostrar o que já mudou deixa a Lisa manter tudo coerente.
+ */
+export async function* streamSingleFileChange({ instruction, summary, path, currentContent, siblingChanges = [], repo }) {
+  const siblingsBlock = siblingChanges.length
+    ? `\n\nOUTROS ARQUIVOS JÁ REESCRITOS NESTA MESMA TAREFA (conteúdo NOVO, pra você manter consistência — ex.: nomes de função/export que mudaram lá precisam bater aqui):\n${siblingChanges.map((f) => `--- ${f.path} ---\n${f.content}`).join("\n\n")}`
+    : "";
+
+  const prompt = `Repositório: ${repo}
+Arquivo: ${path}
+
+CONTEÚDO ATUAL COMPLETO deste arquivo${currentContent ? "" : " (arquivo NOVO — ainda não existe)"}:
+${currentContent || "(vazio)"}
+${siblingsBlock}
+
+PEDIDO GERAL DO USUÁRIO: "${instruction}"
+${summary ? `RESUMO DO PLANO GERAL (pode envolver outros arquivos além deste): ${summary}` : ""}
+
+Reescreva ESTE arquivo especificamente pra fazer a parte que cabe a ele nesse pedido.`;
+
+  const systemInstruction = `Você é a Lisa, reescrevendo UM arquivo de código como parte de uma mudança maior. Responda
+SOMENTE com o conteúdo completo do arquivo depois da mudança — nada de marcador, nada de
+explicação, nada de bloco de código markdown (sem \`\`\`), e principalmente NENHUMA linha de
+comentário no topo repetindo o caminho/nome do arquivo (tipo "// ${path}") — isso não fazia
+parte do arquivo original e já quebrou um build de verdade (era sintaxe de comentário inválida
+no tipo de arquivo em questão). A primeira linha da resposta já é a primeira linha real do
+arquivo.
+
+Se o arquivo já existia, parta EXATAMENTE do conteúdo atual mostrado acima e aplique só a
+parte da mudança que cabe a este arquivo — preserve todo o resto igual (comentários,
+formatação, imports não relacionados). Se for um arquivo novo, escreva ele do zero de forma
+consistente com o resto do pedido.`;
+
+  // retry só na abertura do stream (antes de qualquer chunk chegar) — mesmo padrão de chatStream.
+  const stream = await withTransientRetry(CHAT_MODEL, (client, modelo) =>
+    client.models.generateContentStream({ model: modelo, contents: prompt, config: { systemInstruction } })
+  );
+  for await (const chunk of stream) {
+    if (chunk.text) yield chunk.text;
+  }
+}
+
+/**
+ * Conserta UM erro de sintaxe ESPECÍFICO num arquivo que a Lisa acabou de escrever — chamado
+ * só quando a validação estrutural (ver src/lib/validateSyntax.js, sem IA, roda antes desta
+ * função) já encontrou um problema real, então aqui ela recebe o ERRO exato em vez de ter que
+ * adivinhar o que está errado. Mesmo formato de saída de streamSingleFileChange (conteúdo
+ * puro, em streaming) — é literalmente uma segunda passada sobre o mesmo arquivo.
+ */
+export async function* fixFileSyntaxError({ path, content, error, repo }) {
+  const prompt = `Repositório: ${repo}
+Arquivo: ${path}
+
+Você (a própria Lisa) escreveu este arquivo há pouco, mas ele tem um ERRO DE SINTAXE — um
+validador automático (não é opinião, é um parser de verdade) rejeitou com este erro:
+"${error}"
+
+CONTEÚDO ATUAL (com o erro):
+${content}
+
+Conserte SÓ o problema de sintaxe indicado, preservando o resto do conteúdo e a intenção da
+mudança exatamente como estavam. Não reescreva partes que não têm relação com o erro.`;
+
+  const systemInstruction = `Você é a Lisa, consertando um erro de sintaxe específico que um validador
+automático encontrou no arquivo que você mesma acabou de escrever. Responda SOMENTE com o
+conteúdo completo e corrigido do arquivo — nada de marcador, nada de explicação, nada de bloco
+de código markdown (sem \`\`\`), nenhuma linha de comentário com o caminho do arquivo. A
+primeira linha da resposta já é a primeira linha real do arquivo.`;
+
+  const stream = await withTransientRetry(CHAT_MODEL, (client, modelo) =>
+    client.models.generateContentStream({ model: modelo, contents: prompt, config: { systemInstruction } })
+  );
+  for await (const chunk of stream) {
+    if (chunk.text) yield chunk.text;
+  }
+}
+
+// ---- Mapa de arquitetura: ver src/lib/archDocs.js ----
+/**
+ * O processo desenhado no quadro (31/10/2026, BEYOND-0010): a Lisa devolve só a ESTRUTURA — as
+ * formas (id, tipo, texto, raia) e as ligações —, e o layout é feito no código
+ * (src/lib/diagramaDaLisa.js: montarDocumento). Com `estrutura` (o desenho que está na tela, talvez
+ * mexido pela pessoa), é uma MUDANÇA: ela devolve o desenho inteiro de novo, mantendo os ids do que
+ * continua. A saída passa por validarDesenho antes de ir para a tela.
+ */
+// (02/11/2026: "pegue o exercício que está na minha tela e estruture no ProcessMap" — o desenho não
+// via a tela nem os prints anexados) As imagens vão junto do pedido de desenho e do plano.
+const comImagens = (prompt, imagens) => (imagens?.length
+  ? [{ role: "user", parts: [{ text: prompt }, ...imagens.map((img) => ({ inlineData: { mimeType: img.mimeType, data: img.data } }))] }]
+  : prompt);
+const notaDasImagensDoDesenho = (imagens) => (imagens?.length
+  ? `HÁ ${imagens.length === 1 ? "UMA IMAGEM" : `${imagens.length} IMAGENS`} JUNTO DO PEDIDO (${imagens.map((i) => (i.origem === "tela" ? "a tela da pessoa agora" : `um print anexado${i.nome ? ` "${i.nome}"` : ""}`)).join("; ")}): o conteúdo pedido pode estar nela ("o exercício da minha tela", "este print", "isso") — leia e use o que está lá, fielmente, com os nomes e textos que aparecem.\n`
+  : "");
+// o pedido nas palavras da pessoa, quando quem pede o desenho é o plano (que escreve a instrução de cada desenho)
+const blocoDoOriginal = (original, pedido) => (original && original.trim() !== String(pedido || "").trim()
+  ? `O PEDIDO DA PESSOA, COM AS PALAVRAS DELA (o tipo de desenho e o conteúdo que ela pediu valem; o PEDIDO abaixo é a parte que cabe a este desenho):\n"${original.slice(0, 6000)}"\n`
+  : "");
+// a segunda volta: o que a primeira tentativa deixou de cumprir (src/lib/diagramaDaLisa.js: oQueFaltou)
+const blocoDoQueFaltou = (faltou) => (faltou?.length
+  ? `\nATENÇÃO — A SUA PRIMEIRA TENTATIVA NÃO CUMPRIU O PEDIDO: ${faltou.join("; ")}. Refaça cumprindo isso, sem perder o resto.`
+  : "");
+
+export async function desenharDiagrama({ pedido, estrutura = null, conversa = "", contexto = "", projeto = "", tipo = null, imagens = [], original = "", faltou = [] }) {
+  const formas = TIPOS.map((t) => `- ${t}: ${FORMAS[t].nome}`).join("\n");
+  const exigido = TIPOS_DE_DESENHO[tipo];
+  const prompt = [
+    contexto
+      ? `O CÓDIGO DOS REPOSITÓRIOS VINCULADOS À CONVERSA (para "essa arquitetura", "o meu sistema": desenhe o que está AQUI, com os nomes reais de arquivos, rotas, serviços e tabelas):\n${contexto.slice(0, 40000)}\n`
+      : "",
+    projeto
+      ? `O PROJETO DO PROCESSMAP ONDE ESTE DESENHO MORA (os desenhos dele como estão salvos — mantenha os mesmos nomes de etapas, áreas/raias e termos, e não repita o que outro fluxo já detalha):\n${projeto.slice(0, 30000)}\n`
+      : "",
+    conversa ? `A CONVERSA ATÉ AQUI (contexto):\n${conversa.slice(-6000)}\n` : "",
+    estrutura
+      ? `O DESENHO QUE ESTÁ NA TELA AGORA (a pessoa pode ter mexido nele — parta DELE; "abaAtiva" é a aba que ela está vendo):\n${estruturaQueCabe(estrutura)}\n`
+      : "",
+    notaDasImagensDoDesenho(imagens),
+    blocoDoOriginal(original, pedido),
+    exigido?.formas
+      ? `TIPO DE DESENHO PEDIDO: ${exigido.nome}. Use SÓ estas formas: ${exigido.formas.join(", ")} (e "note" para anotações); "colecao": "${exigido.colecao}".${exigido.raias ? " Toda forma leva a \"raia\" de quem faz a etapa." : ""}\n`
+      : "",
+    `PEDIDO: "${String(pedido || "").slice(0, 8000)}"${blocoDoQueFaltou(faltou)}`,
+  ].filter(Boolean).join("\n");
+
+  const systemInstruction = `Você é a Lisa e desenha processos num quadro de diagramas (fluxograma, BPMN, UML de atividades,
+arquitetura de software ou de nuvem, C4, modelo de dados). Você NÃO escreve coordenadas: devolve a
+estrutura e o quadro organiza o desenho sozinho.
+
+As formas que existem (o "tipo" é o nome à esquerda):
+${formas}
+
+FAÇA EXATAMENTE O QUE A PESSOA PEDIU:
+- O TIPO de desenho que ela disse (BPMN, UML de atividades, diagrama de classes, casos de uso, modelo de
+  dados, C4, arquitetura, com raias) é o tipo que sai, com as formas dessa família — nunca outro.
+- O CONTEÚDO que ela deu (as etapas, os nomes, as áreas, os textos — no pedido, nas imagens, no código ou
+  na conversa) vai TODO, com as palavras dela e na ordem dela: não junte, não resuma, não renomeie, não
+  pule nenhum item e não acrescente etapas que ela não pediu. Só complete por conta própria o que ela não
+  disse (o início e o fim, uma decisão óbvia entre duas etapas) ou quando ela pedir para você criar o conteúdo.
+
+Regras:
+- O desenho tem ABAS (páginas do quadro). "abas": cada uma com "id" curto (sem espaço nem acento), "nome",
+  "formas" e "ligacoes". Num desenho novo, uma aba só (id "p1"), a não ser que o pedido peça abas
+  ("uma aba por área", "o subprocesso numa aba separada").
+- Numa MUDANÇA, devolva TODAS as abas que existem, na mesma ordem:
+  a aba que o pedido não mexe vai só com { "id", "nome", "manter": true } (sem formas) — ela fica
+  exatamente como está; a aba que muda vai INTEIRA (todas as formas e ligações dela, com os ids).
+  NUNCA devolva uma aba pela metade: forma que você não devolve some do desenho da pessoa.
+  Aba marcada "naoCoube": true veio sem as formas (o desenho é grande): devolva { "id", "nome", "manter": true }.
+  Pedido que não cita aba é sobre a aba que a pessoa está vendo ("abaAtiva").
+- Criar aba ("crie uma aba…", "separe em abas…", "detalhe a aprovação numa aba nova"): acrescente a aba
+  com um id novo e as formas dela. Quando a aba nova detalha uma etapa de outra aba, ponha nessa etapa
+  "link": o id da aba nova (no quadro, Ctrl+clique na etapa abre a aba) — e devolva a aba da etapa
+  inteira, com o link. Separar em abas é MOVER: a forma que foi para a aba nova sai da aba de antes.
+- Renomear aba: a aba com o "nome" novo (com "manter": true se nada mais nela muda).
+- Apagar aba: o id dela em "abasRemovidas" (aba que você só deixar de fora NÃO é apagada).
+- "abaAtiva": a aba que a pessoa deve ver depois — a que você criou, senão a que mudou.
+- "formas": cada uma com um "id" curto, sem espaço nem acento (ex.: "pedido", "aprova", "nf"), o "tipo"
+  e o "texto" que aparece dentro: o que a pessoa escreveu para aquela etapa, como ela escreveu; quando é
+  você quem escreve, curto (2 a 6 palavras). Tabela e classe podem ter várias linhas.
+- "raia": quem faz aquela etapa (pessoa, área ou sistema), quando o processo tem mais de um
+  responsável — formas com raia viram raias horizontais (swimlanes). Sem responsáveis, deixe vazio.
+- "ligacoes": de → para, na ordem do fluxo. Saídas de uma decisão ou gateway levam "rotulo"
+  (ex.: Sim/Não, aprovado/recusado). Volta para uma etapa anterior (refazer) também é ligação.
+  "ponta": "arrow" (normal); em modelo de dados, as de cardinalidade ("oneOnly", "many", "zeroMany");
+  em classes, "triangle" (herança). "tracejada" para dependência, mensagem ou fluxo opcional.
+- A família de formas vai em "colecao" (${COLECOES.join(", ")}). Se a pessoa disse o tipo, é ele (veja
+  TIPO DE DESENHO PEDIDO). Se não disse: fluxograma simples → terminal/process/decision; "BPMN" ou
+  processo de negócio com áreas → bpmn*; arquitetura → arch*/cloud*; C4 → c4*; dados → dbTable.
+- Comece por um início e termine num fim quando for um processo. Quantas formas o conteúdo pedir (até 60).
+- Se houver um desenho na tela, é uma MUDANÇA: devolva o desenho INTEIRO atualizado, mantendo o "id"
+  de toda forma que continua (é assim que o que a pessoa arrumou fica no lugar), e mude só o que foi pedido.
+  "Crie", "inclua", "acrescente" uma forma (uma nota, uma etapa) é ACRESCENTAR uma forma NOVA, com id novo:
+  as que já existem, anotações inclusive, voltam com o MESMO texto — só reescreva o texto de uma forma que
+  existe quando o pedido mandar ("atualize a nota", "reescreva", "corrija").
+- "cor": a cor de cada forma (${NOMES_DAS_CORES.join(", ")}). Num desenho novo, deixe sem cor (cada tipo
+  tem a sua), a não ser que o pedido fale de cor. Numa MUDANÇA, cada forma já vem com a cor que tem na
+  tela: devolva a MESMA cor, a não ser que o pedido mexa nela.
+- A pessoa pode apontar formas pela APARÊNCIA, e não só pelo texto: pela cor ("as vermelhas", "as
+  atividades em âmbar"), pelo tipo ("os losangos", "as decisões") ou pela raia ("o que está no
+  Financeiro"). Ache TODAS as formas que batem e faça o que foi pedido com elas:
+  "limpe", "apague", "remova", "tire" as X → tire essas formas do desenho e religue o fluxo em volta
+  (quem apontava para elas passa a apontar para a etapa seguinte);
+  "pinte de verde", "deixe em vermelho", "marque como concluída" → troque a cor;
+  "tire a cor", "volte ao normal" → a cor volta para "azul".
+  TODA troca de cor vai também em "pintar": uma entrada { aba, id, cor } para cada forma cuja cor mudou
+  (sem troca de cor, "pintar" fica vazio).
+  Na "explicacao", diga quais formas foram (pelo texto delas). Se nenhuma forma tiver aquela cor, não
+  mude nada e diga isso.
+- "explicacao": 1 a 3 frases em português, falando com a pessoa, dizendo o que você desenhou ou mudou.
+- "titulo": o nome do processo.
+- Se o PEDIDO trouxer um diagrama em texto (Mermaid, PlantUML), desenhe fielmente o que ele descreve: as
+  mesmas etapas, decisões e ligações (cada "subgraph" vira uma raia), com as formas certas do quadro.
+- Arquitetura de um sistema: quem usa, as telas/apps, as rotas/APIs, os serviços externos (IA, banco,
+  armazenamento) e as ligações com o que trafega no rótulo; agrupe por camada ou responsável com raias.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: comImagens(prompt, imagens),
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              titulo: { type: "STRING" },
+              colecao: { type: "STRING", enum: COLECOES },
+              explicacao: { type: "STRING" },
+              abaAtiva: { type: "STRING" },
+              abas: {
+                type: "ARRAY",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    id: { type: "STRING" },
+                    nome: { type: "STRING" },
+                    manter: { type: "BOOLEAN" },
+                    formas: {
+                      type: "ARRAY",
+                      items: {
+                        type: "OBJECT",
+                        properties: {
+                          id: { type: "STRING" }, tipo: { type: "STRING", enum: TIPOS }, texto: { type: "STRING" }, raia: { type: "STRING" },
+                          cor: { type: "STRING", enum: NOMES_DAS_CORES }, link: { type: "STRING" },
+                        },
+                        required: ["id", "tipo", "texto"],
+                      },
+                    },
+                    ligacoes: {
+                      type: "ARRAY",
+                      items: {
+                        type: "OBJECT",
+                        properties: { de: { type: "STRING" }, para: { type: "STRING" }, rotulo: { type: "STRING" }, tracejada: { type: "BOOLEAN" }, ponta: { type: "STRING", enum: PONTAS } },
+                        required: ["de", "para"],
+                      },
+                    },
+                  },
+                  required: ["id", "nome"],
+                },
+              },
+              abasRemovidas: { type: "ARRAY", items: { type: "STRING" } },
+              pintar: {
+                type: "ARRAY",
+                items: { type: "OBJECT", properties: { aba: { type: "STRING" }, id: { type: "STRING" }, cor: { type: "STRING", enum: NOMES_DAS_CORES } }, required: ["id", "cor"] },
+              },
+            },
+            required: ["titulo", "colecao", "explicacao", "abas"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_DO_DESENHO_MS }
+  );
+  try {
+    return JSON.parse(res.text);
+  } catch {
+    throw new Error("a resposta do desenho não veio em JSON válido — tente de novo");
+  }
+}
+
+/**
+ * A Lisa planeja o trabalho num projeto do ProcessMap (01/11/2026): lê o pedido (com os erros de
+ * digitação e de transcrição de quem fala) e os desenhos do projeto, e devolve { acao: "mudar" |
+ * "responder", explicacao, operacoes: [{ fluxo (id, ou vazio para um desenho novo), nome, tipo, pedido
+ * (a instrução completa para aquele desenho) }] }. Conferido por validarPlano
+ * (src/lib/processmapNaConversa.js); quem executa é a página do Assistente.
+ */
+export async function planejarNoProjeto({ pedido, projeto = "", fluxos = [], aberto = "", conversa = "", complemento = "", imagens = [], confirmado = false }) {
+  const lista = fluxos.map((f) => `- id "${f.id}": "${f.nome}" (${f.modo === "mindmap" ? "mapa mental" : "fluxograma"}, ${f.formas ?? "?"} formas)${f.id === aberto ? " — aberto no quadro agora" : ""}`).join("\n");
+  const prompt = [
+    // (01/11/2026: o plano refez pedidos antigos da conversa em vez do pedido de agora)
+    conversa ? `A CONVERSA ATÉ AQUI (contexto: os pedidos antigos dela já foram tentados, e a resposta da Lisa diz o que mudou de verdade em cada desenho — "mudou: …", "não mudou nada", "não deu"):\n${conversa.slice(-6000)}\n` : "",
+    `OS DESENHOS DO PROJETO:\n${lista || "(nenhum ainda)"}\n`,
+    projeto ? `O CONTEÚDO DELES:\n${projeto.slice(0, 30000)}\n` : "",
+    notaDasImagensDoDesenho(imagens),
+    `O PEDIDO DE AGORA (é ESTE que você planeja): "${String(pedido || "").slice(0, 6000)}"`,
+    // (02/11/2026) a pessoa já disse "sim, pode fazer" ao que a Lisa entendeu na conversa
+    confirmado ? `\nA PESSOA JÁ CONFIRMOU que quer o desenho feito ou mudado: devolva "mudar" (ou "documentar", se ela só quer texto) — nunca "responder".` : "",
+    // a segunda volta (src/app/api/processmap/plano): os desenhos que o primeiro plano esqueceu
+    complemento ? `\nATENÇÃO: ${complemento}` : "",
+  ].filter(Boolean).join("\n");
+
+  const systemInstruction = `Você é a Lisa e trabalha nos desenhos (fluxogramas e mapas mentais) de um projeto do ProcessMap.
+A pessoa fala com você por voz ou por texto, muitas vezes com erros de digitação e de transcrição ("cir"
+é "crie", "fluogramas" é "fluxogramas", "abacto" é "Abacato") — entenda a INTENÇÃO, não as palavras.
+Cuidado com negação quebrada pela digitação, que inverte o sentido: "porme em a", "porem sm a", "porém
+em a função" = "porém SEM a função"; "cm" = "com", "sm" = "sem". "Porém" anuncia uma exceção: "uma
+versão 100% funcional, porém [sem] a função X" quer dizer que a função X fica DE FORA. Na dúvida entre
+"com" e "sem", fique com o que faz sentido na frase e diga na "explicacao" como entendeu.
+
+Decida:
+- "acao": "mudar" quando o pedido é criar, incluir, pôr, mudar, pintar, remover, reorganizar ou anotar
+  algo nos desenhos do projeto; "responder" quando é só pergunta, análise ou opinião sobre o projeto;
+  "documentar" quando a pessoa quer SÓ um TEXTO feito a partir dos desenhos, fora deles — arquivo .md,
+  markdown, README, documento, especificação, "no editor", "para pedir ao Claude/a uma IA construir".
+  Planeje SÓ o pedido de agora: não refaça pedidos antigos da conversa por conta própria. Mas a conversa
+  diz a QUE o pedido de agora se refere: "corrija isso", "não ficou certo", "ainda está faltando", "a
+  nota está errada" falam do último desenho e da última mudança — use a conversa para achar o desenho,
+  a aba e a forma certos, e faça a correção pedida ("mudar"), dizendo na instrução EXATAMENTE o que trocar
+  (o texto de antes e o de depois, a etapa a incluir e entre quais, a aba). Corrigir o texto de uma nota
+  que existe é reescrever ESSA nota (mesmo id), não criar outra.
+- "documentos": os arquivos .md que o pedido de agora pede (MD, markdown, arquivo, documento, "no editor",
+  mesmo escrito com erro: "mds", "emedê", "aruivo md", "editro"), escritos no editor de código. Quantos o
+  pedido pedir: "um arquivo md" = UM; "um md por fluxograma e mapa mental" = um por desenho. Cada um:
+  "arquivo" (nome curto-com-hifens.md, do assunto), "titulo", "desenhos" (ids da lista em que ele se
+  baseia; vazio = o projeto todo), "novos" (true se ele fala dos desenhos que este plano CRIA) e
+  "pedido": o que o documento deve trazer, COMPLETO e sobre o ASSUNTO do pedido (ex.: segurança — a
+  arquitetura de hoje, onde falhamos, os riscos priorizados e o que fazer antes de expandir o uso), não
+  um modelo fixo. Sem arquivo pedido, "documentos" fica vazio.
+- Um pedido pode ter as duas coisas: "faça um fluxograma da arquitetura … faça um md também" = "mudar"
+  com UMA operação (o desenho NOVO, "fluxo" vazio) + um documento com "novos": true. Quando o pedido pede
+  documento, NÃO mude os desenhos que já existem, a não ser que ele mande mudar um deles com todas as
+  letras ("inclua no fluxo X…"); explicar, documentar, especificar ou analisar NÃO é mudar desenho.
+  Só documento, sem desenho novo nem mudança: "documentar".
+  Citar outro sistema no meio do pedido (ex.: "uma versão do Abacato integrada à Lisa") não muda isso:
+  é conteúdo do desenho.
+- "operacoes" (só com "mudar"): uma por desenho a mudar ou criar, na ordem em que fazem sentido.
+  - "fluxo": o id do desenho existente (da lista); vazio para um desenho novo (aí dê "nome" e "tipo").
+  - "tipo" (do desenho novo): o que a pessoa DISSE — "bpmn", "uml de atividades", "diagrama de classes",
+    "casos de uso", "modelo de dados", "c4", "arquitetura", "nuvem", "raias" (fluxograma com swimlanes),
+    "fluxograma simples", "mapa mental"; "fluxograma" quando ela não disse um tipo. Nunca troque o tipo
+    que ela pediu por outro. "arquitetura"/"nuvem" só quando o desenho é a arquitetura de um sistema
+    (componentes, serviços, bancos); o passo a passo de um exercício ou de um processo é "fluxograma".
+  - "pedido": a instrução COMPLETA e independente para aquele desenho — quem a executa vê esse desenho
+    e as imagens, não a conversa. Escreva tudo que precisa entrar, com os textos prontos (nomes de
+    etapas, tópicos, o texto inteiro de uma nota), em português. O conteúdo que a PESSOA deu (as etapas,
+    os nomes, os textos, a lista dela, o que está na tela ou no print) vai com as palavras dela, item por
+    item, sem resumir, juntar, trocar nem acrescentar. Diga o tipo do desenho na instrução.
+  - Para a pessoa, "fluxograma" é QUALQUER desenho do projeto (fluxograma ou mapa mental): "todos os
+    fluxogramas", "todos os desenhos", "em cada fluxo" = uma operação para CADA desenho da lista, mapas
+    mentais inclusive. Não pule nenhum, nem o que ainda está quase vazio.
+  - Desenho com várias abas (veja as linhas "ABA" no conteúdo): o que vale para "todos" vai em CADA
+    aba — diga isso na instrução, nomeando as abas, e escreva o texto de cada uma.
+  - Comentário, nota, anotação, explicação num fluxograma: peça "uma forma do tipo note (anotação), sem
+    ligações, com o texto: …" e escreva o texto inteiro, DETALHADO: o conceito e cada decisão com o
+    porquê, ligados ao que aquele desenho (ou aquela aba) mostra — em tópicos com "• ", até uns 1300
+    caracteres. Quebre as linhas com quebra de linha de verdade, nunca escrevendo "\\n". Num mapa
+    mental: um tópico principal "Conceito e decisões" com subtópicos curtos (uma decisão e o porquê em
+    cada um).
+  - Pedido que fala de "as funcionalidades", "o fluxo de X" etc.: ache o desenho certo pelo nome e
+    pelo conteúdo. Nada que se encaixe: crie um desenho novo para isso.
+  - Ao descrever conceito, decisões e motivos do projeto, use o que está nos desenhos e na conversa
+    (e o que o próprio pedido decide); não invente fatos que contradigam o projeto.
+- Pedido ambíguo (o desenho, a aba ou a forma não foram ditos certinho): NÃO devolva "responder" para
+  pedir o nome exato — escolha o mais provável pelo assunto, pelos nomes parecidos e pela conversa, e
+  diga na "explicacao" como entendeu ("Entendi que é a nota da aba Fluxo Mobile do Fluxo de Uso MVP").
+  A pessoa confirma antes de eu fazer, e corrige se eu entendi errado.
+- "explicacao": 1 a 2 frases, falando com a pessoa, dizendo o que você entendeu e vai fazer (sem listar tudo).`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: comImagens(prompt, imagens),
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              acao: { type: "STRING", enum: ["mudar", "responder", "documentar"] },
+              explicacao: { type: "STRING" },
+              operacoes: {
+                type: "ARRAY",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    fluxo: { type: "STRING" }, nome: { type: "STRING" },
+                    tipo: { type: "STRING", enum: TIPOS_NO_PLANO }, pedido: { type: "STRING" },
+                  },
+                  required: ["pedido"],
+                },
+              },
+              documentos: {
+                type: "ARRAY",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    arquivo: { type: "STRING" }, titulo: { type: "STRING" }, desenhos: { type: "ARRAY", items: { type: "STRING" } },
+                    novos: { type: "BOOLEAN" }, pedido: { type: "STRING" },
+                  },
+                  required: ["arquivo", "titulo", "pedido"],
+                },
+              },
+            },
+            required: ["acao", "explicacao"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_LONGO_MS }
+  );
+  try {
+    return JSON.parse(res.text);
+  } catch {
+    throw new Error("o plano não veio em JSON válido — tente de novo");
+  }
+}
+
+/**
+ * O RETRATO da pessoa (01/11/2026, o MVP: "perguntas pessoais — qual seu nome, me descreva você —, algo
+ * que ajude a Lisa a formar a persona do usuário que ela vai tratar"). A partir do que a pessoa contou
+ * na entrevista, a Lisa escreve para si mesma quem é a pessoa e como falar com ela; o retrato vai na
+ * instrução de cada conversa dessa pessoa (src/lib/modoUsuario.js: secaoDoPerfil). Devolve o texto.
+ */
+export async function retratoDaPessoa(perfil) {
+  const p = perfil?.preferencias || {};
+  const contou = [
+    perfil?.nome && `Nome: ${perfil.nome}`,
+    p.sobre && `Como se descreve: ${p.sobre}`,
+    p.jeito && `O jeito dela e como prefere que falem com ela: ${p.jeito}`,
+    p.importante && `Importante saber: ${p.importante}`,
+    perfil?.nivel && `Nível em programação: ${perfil.nivel}`,
+    perfil?.area && `Linguagens e tecnologias: ${perfil.area}`,
+    perfil?.objetivos && `Foco agora: ${perfil.objetivos}`,
+    p.ajuda && `Como prefere a ajuda: ${p.ajuda}`,
+    p.tempo && `Tempo por semana: ${p.tempo}`,
+  ].filter(Boolean).join("\n");
+  if (!contou) return "";
+  const systemInstruction = `Você é a Lisa, assistente de desenvolvimento e produtividade. Uma pessoa nova acabou de responder
+à sua entrevista de boas-vindas. Escreva, para VOCÊ MESMA, o retrato dela em 3 a 5 frases curtas, em
+português do Brasil: quem ela é, o jeito dela e COMO você deve falar com ela (tom, nível de detalhe,
+exemplos, o que evitar). Use só o que ela contou — não invente fatos, não julgue, e não registre dados
+sensíveis (saúde, religião, política, documentos), mesmo que apareçam. Responda só com o retrato.`;
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) => client.models.generateContent({ model: modelo, contents: `O QUE A PESSOA CONTOU:\n${contou.slice(0, 3000)}`, config: { systemInstruction } }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_LONGO_MS }
+  );
+  return String(res.text || "").trim().slice(0, 1200);
+}
+
+/**
+ * A Lisa escreve um .md para o editor de código a partir dos desenhos do projeto. Nenhum desenho muda.
+ * Três estilos:
+ *   "livre" (o padrão): o documento que o pedido pede, sobre o ASSUNTO dele (01/11/2026: "faça um
+ *     fluxograma da arquitetura pensando em cibersegurança, onde hoje falhamos … faça um md também" — a
+ *     Lisa escrevia sempre a mesma especificação de MVP); `foco` é o que este arquivo deve trazer.
+ *   "especificacao": a especificação de UM desenho para uma IA de código construir as rotas ("uma aba de
+ *     MD por fluxograma e mapa mental — vou usar para pedir ao Claude construir as rotas").
+ *   "visao-geral": a visão geral do projeto, apontando para `arquivos` (os .md de cada desenho).
+ * `desenhos`: [{ nome, tipo, descricao (o desenho inteiro em texto, com as anotações) }]. `contexto`: o
+ * código dos repositórios ligados à conversa, quando houver. Devolve o Markdown (texto).
+ */
+export async function escreverDocumento({
+  pedido, foco = "", titulo = "", estilo = "livre", desenhos = [], desenho = null, arquivos = [],
+  projeto = "", nomeDoProjeto = "", conversa = "", contexto = "", hoje = "",
+}) {
+  const base = desenhos.length ? desenhos : desenho ? [desenho] : [];
+  const tipo = ["especificacao", "visao-geral"].includes(estilo) ? estilo : "livre";
+  const um = base[0];
+  const prompt = [
+    conversa ? `A CONVERSA ATÉ AQUI (contexto):\n${conversa.slice(-6000)}\n` : "",
+    contexto ? `O CÓDIGO DOS REPOSITÓRIOS LIGADOS À CONVERSA (a evidência do que existe de verdade):\n${String(contexto).slice(0, 40000)}\n` : "",
+    `O PROJETO "${nomeDoProjeto}" DO PROCESSMAP (todos os desenhos, para manter os mesmos nomes e não contradizer nada):\n${String(projeto).slice(0, 40000)}\n`,
+    tipo === "visao-geral"
+      ? `OS ARQUIVOS QUE A LISA ESTÁ ESCREVENDO (um por desenho):\n${arquivos.map((a) => `- ${a.arquivo}: "${a.nome}" (${a.tipo})`).join("\n")}\n`
+      : base.map((d) => `O DESENHO "${d.nome}" (${d.tipo}), inteiro, com as anotações:\n${String(d.descricao).slice(0, 60000 / base.length)}\n`).join("\n"),
+    `O PEDIDO DA PESSOA: "${String(pedido || "").slice(0, 4000)}"`,
+    foco ? `O QUE ESTE ARQUIVO DEVE TRAZER: ${String(foco).slice(0, 4000)}` : "",
+  ].filter(Boolean).join("\n");
+
+  // [título exato da seção, o que vai nela] — o título vai sozinho na linha "## …"
+  const secoes = tipo === "livre" ? "" : (tipo === "visao-geral"
+    ? [
+      ["Conceito do produto", "o que é, para quem, que problema resolve (3 a 6 frases)"],
+      ["Estratégia do MVP", "o que entra, o que fica de fora e por quê"],
+      ["Os desenhos e os arquivos", "tabela | Arquivo | Desenho | O que cobre |"],
+      ["Ordem de construção sugerida", "passos numerados, cada um apontando o arquivo"],
+      ["Decisões que valem para o projeto todo", "tabela | Decisão | Por quê |"],
+      ["Pontos em aberto", "o que os desenhos não respondem"],
+      ["Como usar estes arquivos com o Claude", "um parágrafo pronto para colar"],
+    ]
+    : [
+      ["Conceito", "o que este desenho resolve, para quem (3 a 6 frases)"],
+      ["Estratégia no MVP", "o que entra no MVP e o que fica para depois, com o porquê"],
+      ["Decisões e motivos", "tabela | Decisão | Por quê |"],
+      ["Passo a passo", 'uma subseção "### Aba <nome da aba>" por aba (mapa mental: "### <galho>" por galho); cada passo com quem faz (a raia), o que acontece e os desvios (decisão: Sim/Não e para onde vai)'],
+      ["Rotas, telas e APIs a construir", "tabela | Rota ou tela | Método | O que faz | Passo do desenho |"],
+      ["Dados", "tabela | Entidade | Campos | Para quê |"],
+      ["Critérios de aceite", 'lista "- [ ] Dado …, quando …, então …", testável'],
+      ["Pontos em aberto", "perguntas que o desenho não responde"],
+      ["Como pedir ao Claude", 'um parágrafo pronto para colar ("Construa … seguindo este arquivo …")'],
+    ]).map(([t, conteudo]) => `## ${t}\n   (conteúdo: ${conteudo})`).join("\n");
+  const fonte = base.length ? ` · a partir de ${base.map((d) => `"${d.nome}"`).join(", ")}` : "";
+  const cabeca = tipo === "visao-geral"
+    ? `# ${nomeDoProjeto} — visão geral do MVP\n> Projeto do ProcessMap · gerado pela Lisa em ${hoje} · um arquivo por desenho (tabela abaixo)`
+    : tipo === "especificacao"
+      ? `# ${um?.nome || titulo}\n> Projeto ${nomeDoProjeto} · ${um?.tipo || "desenho"} do ProcessMap · gerado pela Lisa em ${hoje}`
+      : `# ${titulo || "Documento"}\n> Projeto ${nomeDoProjeto} · gerado pela Lisa em ${hoje}${fonte}`;
+
+  const comoEscrever = tipo === "livre"
+    ? `Escreva o documento que o pedido pede, sobre o ASSUNTO do pedido ("o que este arquivo deve trazer"),
+com títulos "##" que sirvam a esse assunto — não um modelo fixo. Comece com este cabeçalho:
+${cabeca}
+Guias por assunto (use o que couber):
+- Segurança, cibersegurança, riscos, "onde falhamos", "antes de expandir o uso": a arquitetura de hoje
+  (componentes, onde os dados moram, por onde trafegam, quem acessa); onde falhamos hoje — cada lacuna com
+  a evidência (o desenho, o código ou a conversa), o impacto e a chance, numa tabela | Lacuna | Evidência |
+  Risco (alto/médio/baixo) | O que fazer |; o que fazer ANTES de expandir o uso, em ordem (agora / antes
+  de expandir / depois); como verificar cada correção; e os pontos a confirmar. Referências quando
+  ajudarem: OWASP Top 10, LGPD (dados pessoais), ISO/IEC 27001 (controles).
+- Especificação para construir (rotas, telas, "para o Claude construir"): conceito, passo a passo, rotas
+  e telas, dados, critérios de aceite "Dado/quando/então" e um parágrafo pronto para pedir ao Claude.
+- Arquitetura: as camadas, os componentes e as integrações, e as decisões com o porquê.`
+    : `Comece com este cabeçalho e use estes títulos "##", nesta ordem. O título é SÓ o texto da linha "##"; o
+"(conteúdo: …)" diz o que escrever na seção e não aparece no arquivo. Seção sem material nos desenhos:
+escreva "Não definido nos desenhos.".
+${cabeca}
+${secoes}`;
+
+  const systemInstruction = `Você é a Lisa e escreve, em Markdown e em português do Brasil, ${tipo === "visao-geral" ? "a visão geral de um projeto do ProcessMap (o conjunto dos desenhos dele)" : tipo === "especificacao" ? "a especificação de UM desenho (fluxograma ou mapa mental) de um projeto do ProcessMap" : "um documento pedido pela pessoa, a partir dos desenhos de um projeto do ProcessMap"}.
+Quem lê: a equipe e uma IA de código (o Claude), que vai trabalhar a partir deste arquivo. Então:
+preciso, completo, verificável, sem enrolação.
+
+${comoEscrever}
+
+Regras:
+- Use o que está nos desenhos (etapas, raias, decisões, abas, anotações), no código (se veio), na conversa
+  e no pedido. Cite as etapas pelo texto exato do desenho, entre aspas.
+- O que for proposta sua (nome de rota, campo, tela que o desenho não nomeia), marque com "(proposta)";
+  o que você deduz sem evidência, com "(a confirmar)". Não invente fato que contradiga os desenhos.
+- Nada de senha, token, chave, CPF, salário, dado de saúde ou bancário, nem dado pessoal real.
+- Blocos de código só com três crases (nunca quatro).
+- Responda SÓ com o Markdown do arquivo: sem nada antes ou depois e sem cercar tudo num bloco de código.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) => client.models.generateContent({ model: modelo, contents: prompt, config: { systemInstruction } }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_DO_DESENHO_MS }
+  );
+  // (se o modelo cercar o arquivo inteiro num bloco de código, a cerca sai)
+  const texto = String(res.text || "").trim().replace(/^`{3,}\s*(markdown|md)?\s*\n([\s\S]*?)\n`{3,}\s*$/i, "$2").trim();
+  if (!texto) throw new Error("o documento veio vazio — tente de novo");
+  return texto;
+}
+
+/**
+ * A Lisa monta um MAPA MENTAL (01/11/2026): devolve a árvore { titulo, tema, explicacao, topicos:
+ * [{ id, texto, filhos: [{ id, texto, filhos: [{ id, texto }] }] }] } — o quadro faz o layout
+ * (src/lib/diagramaDaLisa.js: validarMapaMental, montarMapaMental). Com `estrutura` (o mapa que está na
+ * tela), é uma mudança: a árvore inteira de volta, com os mesmos ids do que continua.
+ */
+export async function desenharMapaMental({ pedido, estrutura = null, conversa = "", contexto = "", projeto = "", imagens = [], original = "", faltou = [] }) {
+  const prompt = [
+    contexto ? `CONTEXTO (código, ou o desenho que está na tela, para basear o mapa):\n${contexto.slice(0, 40000)}\n` : "",
+    projeto
+      ? `O PROJETO DO PROCESSMAP ONDE ESTE DESENHO MORA (os desenhos dele como estão salvos — mantenha os mesmos nomes de etapas, áreas/raias e termos, e não repita o que outro fluxo já detalha):\n${projeto.slice(0, 30000)}\n`
+      : "",
+    conversa ? `A CONVERSA ATÉ AQUI (contexto):\n${conversa.slice(-6000)}\n` : "",
+    estrutura
+      ? `O MAPA QUE ESTÁ NA TELA AGORA (a pessoa pode ter mexido nele — parta DELE):\n${JSON.stringify(estrutura).slice(0, 100_000)}\n`
+      : "",
+    notaDasImagensDoDesenho(imagens),
+    blocoDoOriginal(original, pedido),
+    `PEDIDO: "${String(pedido || "").slice(0, 8000)}"${blocoDoQueFaltou(faltou)}`,
+  ].filter(Boolean).join("\n");
+
+  const systemInstruction = `Você é a Lisa e monta MAPAS MENTAIS num quadro. Você NÃO escreve coordenadas: devolve a árvore e o
+quadro organiza o desenho sozinho (o tema no centro, os tópicos dos dois lados).
+
+Regras:
+- O CONTEÚDO que a pessoa deu (o tema, os tópicos, a lista dela, o que está na tela ou no print) vai TODO,
+  com as palavras dela e na ordem dela: não junte, não resuma, não renomeie e não pule nenhum. Só crie
+  tópicos por conta própria para o que ela não disse, ou quando ela pedir para você criar o conteúdo.
+- "tema": o assunto central, curto (1 a 5 palavras).
+- "topicos": de 3 a 8 tópicos principais; cada um pode ter "filhos" (até 6) e cada filho, os seus "filhos"
+  (até 5). Textos curtos (1 a 6 palavras) quando é você quem escreve, sem pontuação no fim, sem numerar.
+  Cubra o assunto de forma útil e equilibrada: ideias, partes, causas, ações, exemplos — o que fizer
+  sentido para o pedido.
+- "id": curto, sem espaço nem acento (ex.: "redes", "seo"). Se houver um mapa na tela, é uma MUDANÇA:
+  devolva a árvore INTEIRA atualizada, mantendo o "id" de todo tópico que continua (é assim que o que
+  a pessoa arrumou fica no lugar), e mude só o que foi pedido.
+- Se o contexto trouxer um fluxograma ou código e o pedido for transformá-lo em mapa mental, organize
+  o conteúdo dele em tópicos.
+- "cor": a cor de cada galho (tópico principal): ${NOMES_DAS_CORES.join(", ")}. Num mapa novo, deixe sem cor
+  (o quadro alterna sozinho). Numa MUDANÇA, devolva a cor que cada galho já tem, a não ser que o pedido
+  mexa nela. A pessoa pode apontar galhos pela cor ("limpe os galhos vermelhos", "pinte o de marketing
+  de verde"): ache todos os que batem e faça o pedido (limpar/apagar/remover = tirar o galho inteiro).
+  Toda troca de cor vai também em "pintar": { id, cor } de cada galho que mudou (sem troca, vazio).
+- "explicacao": 1 a 3 frases em português, falando com a pessoa, dizendo o que você montou ou mudou.
+- "titulo": o nome do mapa.`;
+
+  const topico = (filhos, comCor = false) => ({
+    type: "OBJECT",
+    properties: {
+      id: { type: "STRING" }, texto: { type: "STRING" },
+      ...(comCor ? { cor: { type: "STRING", enum: NOMES_DAS_CORES } } : {}),
+      ...(filhos ? { filhos } : {}),
+    },
+    required: ["id", "texto"],
+  });
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: comImagens(prompt, imagens),
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              titulo: { type: "STRING" },
+              tema: { type: "STRING" },
+              explicacao: { type: "STRING" },
+              topicos: { type: "ARRAY", items: topico({ type: "ARRAY", items: topico({ type: "ARRAY", items: topico(null) }) }, true) },
+              pintar: {
+                type: "ARRAY",
+                items: { type: "OBJECT", properties: { id: { type: "STRING" }, cor: { type: "STRING", enum: NOMES_DAS_CORES } }, required: ["id", "cor"] },
+              },
+            },
+            required: ["titulo", "tema", "explicacao", "topicos"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_DO_DESENHO_MS }
+  );
+  try {
+    return JSON.parse(res.text);
+  } catch {
+    throw new Error("a resposta do mapa mental não veio em JSON válido — tente de novo");
+  }
+}
+
+// O DIAGRAMA (Mermaid) é montado no CÓDIGO a partir do grafo de dependência REAL (calculado
+// pelos imports indexados, não pela IA) — de propósito: pedir pra IA escrever sintaxe Mermaid
+// direto já causou dor de cabeça parecida com o bug do comentário no topo do CSS (texto solto
+// que devia ser sintaxe estrita tende a sair errado). A IA só escreve PROSA aqui (descrição de
+// área, resumo geral) — nunca nada que precise ser sintaticamente exato.
+
+/**
+ * Descreve o que UMA área (agrupamento de arquivos por pasta) de um repositório faz, só pelos
+ * CAMINHOS dos arquivos dela (sem ler conteúdo — rápido e barato, funciona bem porque nomes de
+ * arquivo/pasta já carregam bastante sinal). `relatedTo` (opcional) — nomes de outras áreas que
+ * o grafo de dependência real já mostrou que esta área importa ou é importada por, pra ajudar a
+ * IA a situar o papel dela no todo.
+ */
+export async function describeArchArea({ repo, areaName, paths, relatedTo = [] }) {
+  const prompt = `Repositório: ${repo}
+Área: ${areaName}
+
+ARQUIVOS DESTA ÁREA (${paths.length} no total, só os caminhos):
+${paths.slice(0, 60).join("\n")}${paths.length > 60 ? `\n... e mais ${paths.length - 60} arquivo(s)` : ""}
+${relatedTo.length ? `\nESTA ÁREA SE CONECTA (de verdade, via import) COM: ${relatedTo.join(", ")}` : ""}
+
+Descreva em 1-3 frases o que essa área do código provavelmente faz, com base nos nomes dos
+arquivos e da pasta — convenções comuns de projeto (ex.: "api" = rotas de backend, "components"
+= peças de UI reutilizáveis, "lib"/"utils" = lógica compartilhada, "hooks" = React hooks).`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: {
+          systemInstruction: "Você documenta a arquitetura de um repositório de código, descrevendo áreas (pastas) só pelos caminhos dos arquivos dentro delas. Seja direto e específico — evite generalidades vagas tipo 'contém arquivos relacionados ao projeto'.",
+          responseMimeType: "application/json",
+          responseSchema: { type: "OBJECT", properties: { summary: { type: "STRING" } }, required: ["summary"] },
+        },
+      }),
+    { attempts: 2, delayMs: 600, tetoMs: TETO_LONGO_MS }
+  );
+
+  try {
+    const parsed = JSON.parse(res.text);
+    return parsed.summary || "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Parágrafo de VISÃO GERAL do repositório inteiro, a partir do que já foi descoberto sobre
+ * cada área — chamado uma vez, no final, depois de todas as áreas já descritas.
+ */
+export async function writeArchOverview({ repo, areaSummaries }) {
+  const areasBlock = areaSummaries.map((a) => `- ${a.name} (${a.fileCount} arquivo${a.fileCount > 1 ? "s" : ""}): ${a.summary}`).join("\n");
+
+  const prompt = `Repositório: ${repo}
+
+ÁREAS JÁ MAPEADAS:
+${areasBlock}
+
+Escreva um parágrafo de visão geral (4-8 frases) explicando, pra alguém que nunca viu este
+código, do que se trata o projeto e como as peças principais se encaixam — cite as áreas mais
+centrais pelo nome. Tom direto, técnico, em português.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: { systemInstruction: "Você escreve a introdução de uma documentação técnica de arquitetura de software, em português, direto ao ponto." },
+      }),
+    { attempts: 2, delayMs: 600, tetoMs: TETO_LONGO_MS }
+  );
+  return (res.text || "").trim();
+}
+
+/**
+ * Explica UM arquivo "chave" (escolhido por código, ver src/lib/archDocs.js — os mais
+ * importados por outros arquivos, ou pontos de entrada convencionais como page.js/route.js)
+ * pro leitor entender o PAPEL dele na arquitetura sem precisar ler o código inteiro sozinho.
+ * `content` já vem truncado por quem chama, se for muito grande.
+ */
+export async function explainKeyFile({ repo, path, content, area }) {
+  const prompt = `Repositório: ${repo}
+Arquivo: ${path} (área: ${area})
+
+CONTEÚDO:
+${content}
+
+Explique o que este arquivo faz e por que ele é uma peça importante da arquitetura — em 3-6
+frases. Cite trechos/nomes de função específicos quando ajudar a explicar. Não descreva
+sintaxe óbvia linha a linha; foque no PAPEL do arquivo no sistema como um todo.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: { systemInstruction: "Você explica trechos de código-chave de um repositório pra documentação técnica, em português — direto, específico, sem parafrasear sintaxe óbvia." },
+      }),
+    { attempts: 2, delayMs: 600, tetoMs: TETO_LONGO_MS }
+  );
+  return (res.text || "").trim();
+}
+
+/**
+ * FLUXO DE USO (passo a passo de como um usuário/processo interage com a aplicação) e CASOS
+ * DE USO (por ator) do repositório inteiro — chamado uma vez, depois de todas as áreas já
+ * descritas. Devolve dados ESTRUTURADOS (nunca sintaxe de diagrama) — o diagrama em si (Mermaid)
+ * é montado em código a partir disso, pelo mesmo motivo do grafo de dependência: texto solto
+ * que precisa "compilar" certinho é onde a IA mais erra a mão.
+ */
+export async function planNarrative({ repo, overview, areaSummaries }) {
+  const areasBlock = areaSummaries.map((a) => `- ${a.name}: ${a.summary}`).join("\n");
+
+  const prompt = `Repositório: ${repo}
+
+VISÃO GERAL: ${overview}
+
+ÁREAS MAPEADAS:
+${areasBlock}
+
+Com base nisso, produza:
+1. "usage_flow": o fluxo de uso PRINCIPAL da aplicação, como uma sequência de 5 a 10 passos em
+   ORDEM, cada um com quem age ("actor" — ex.: "Usuário", "Frontend", "API", "Banco de dados",
+   um serviço externo específico) e o que acontece nesse passo ("action", 1 frase objetiva).
+   Cubra do início (o usuário chegando/interagindo) até o resultado final.
+2. "use_cases": os atores do sistema (ex.: "Usuário", "Administrador", "Tarefa agendada/cron",
+   um serviço externo que aciona algo) e, pra CADA ator, uma lista de 2-5 casos de uso
+   (frases curtas, no infinitivo, tipo "Perguntar algo à Lisa", "Disparar sync periódico").`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: prompt,
+        config: {
+          systemInstruction: "Você documenta o fluxo de uso e os casos de uso de uma aplicação de software pra documentação técnica, em português, com base no que já se sabe sobre as áreas do código.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              usage_flow: {
+                type: "ARRAY",
+                items: { type: "OBJECT", properties: { actor: { type: "STRING" }, action: { type: "STRING" } }, required: ["actor", "action"] },
+              },
+              use_cases: {
+                type: "ARRAY",
+                items: { type: "OBJECT", properties: { actor: { type: "STRING" }, cases: { type: "ARRAY", items: { type: "STRING" } } }, required: ["actor", "cases"] },
+              },
+            },
+            required: ["usage_flow", "use_cases"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_LONGO_MS }
+  );
+
+  try {
+    const parsed = JSON.parse(res.text);
+    return { usageFlow: parsed.usage_flow || [], useCases: parsed.use_cases || [] };
+  } catch {
+    return { usageFlow: [], useCases: [] };
+  }
+}
+
+// ---- TTS: gera áudio a partir de texto ----
+//
+// BEYOND-0001 — a voz caía para a do navegador, sobretudo em mensagens longas. Medição de
+// 07/10/2026 (nove chamadas por modelo, três tamanhos; tempo de síntese / segundos de áudio):
+//
+//   gemini-2.5-flash-preview-tts   ~120c 43s·12s·6s   ~250c 10s·13s·ERRO 500   ~520c 15s·PENDUROU·PENDUROU
+//   gemini-3.8-flash-tts           ~120c 22s·5s·5s    ~250c 10s·9s·9s          ~520c 16s·17s·14s
+//   gemini-3.1-flash-tts-preview   ~120c 18s·8s·8s    ~250c 12s·13s·15s        ~520c 23s·23s·43s
+//
+// Três conclusões, e a segunda desmente a anotação de 16/09 (que dizia "o tamanho não importa"):
+//
+//   1. O modelo antigo, ainda em preview, pendura com frequência — e mais nos textos longos.
+//   2. O tempo CRESCE com o texto (~5s para uma frase, ~15s para ~520 caracteres no 3.8). Em
+//      16/09 isso ficou escondido atrás da taxa de travamento do modelo antigo. Com um teto
+//      fixo de 26s, uma resposta longa (a rota aceitava 1.200 caracteres numa chamada só)
+//      estourava as três tentativas, caía para o navegador e armava o disjuntor de 60s do
+//      Assistente — levando as mensagens seguintes junto.
+//   3. A saúde de cada modelo VARIA ao longo do dia. Horas depois da tabela acima, ao meio-dia,
+//      o 3.8 pendurou 4 de 12 chamadas enquanto o 3.1 não pendurou nenhuma em 13. Nenhum modelo
+//      sozinho é confiável o dia inteiro.
+//
+// Por isso: o 3.8 (fora de preview) como principal e o 3.1 como reserva, com as tentativas
+// ALTERNANDO entre os dois e a segunda começando cedo — vence o que estiver saudável naquela
+// hora —; teto e hedge proporcionais ao tamanho; e quem chama (Assistente, speakText) fatiando
+// respostas longas em pedaços (pedacosParaVoz). O 2.5 saiu da lista: foi o mais instável e é
+// da geração que o Google já está desligando (o gemini-2.5-flash de texto responde 404).
+const TTS_MODEL = process.env.GEMINI_TTS_MODEL || "gemini-3.8-flash-tts";
+const TTS_MODELOS = [...new Set([
+  TTS_MODEL,
+  ...String(process.env.GEMINI_TTS_RESERVAS || "gemini-3.1-flash-tts-preview")
+    .split(",").map((m) => m.trim()).filter(Boolean),
+])];
+
+// Quanto esperar UMA tentativa de síntese: base fixa mais um tanto por caractere, porque gerar
+// mais áudio leva mais tempo (ver a tabela acima). Largo de propósito — 18s + 60ms/caractere —
+// para não cortar uma resposta BOA e lenta do 3.1 (picos de 27-29s num pedaço de ~185
+// caracteres). Quem resolve a chamada pendurada é o hedge, não o teto.
+const TTS_TETO_BASE_MS = 18_000;
+const TTS_TETO_POR_CARACTERE_MS = 60;
+const TTS_TETO_MINIMO_MS = 25_000;
+const TTS_TETO_MAXIMO_MS = 50_000;
+export function tetoDaTentativaDeVoz(caracteres) {
+  return Math.min(TTS_TETO_MAXIMO_MS, Math.max(TTS_TETO_MINIMO_MS, TTS_TETO_BASE_MS + caracteres * TTS_TETO_POR_CARACTERE_MS));
+}
+const DEFAULT_TTS_VOICE = process.env.GEMINI_TTS_VOICE || "Kore";
+
+// Pra o painel de status (/api/gemini-keys/status) montar a matriz chave×modelo sem nunca
+// expor as chaves em si — só quantas existem e quais modelos usam cota própria.
+export const GEMINI_KEY_COUNT = KEYS.length;
+export const GEMINI_MODELS = { chat: CHAT_MODEL, tts: TTS_MODEL, embed: EMBED_MODEL };
+
+/**
+ * Quanto esperar por uma tentativa antes de disparar OUTRA em paralelo — numa chave diferente E
+ * num modelo diferente (ver sintetizarComHedge).
+ *
+ * A ideia vem da medição de 19/09/2026: uma tentativa boa volta num tempo previsível, uma ruim
+ * não volta nunca — morre no teto e só então a seguinte começaria, do zero. Disparar a seguinte
+ * enquanto a primeira ainda está pendurada transforma "teto + tudo de novo" em "uma segunda
+ * chance já rodando". A perdedora é abortada assim que a outra chega.
+ *
+ * Proporcional ao texto pelo mesmo motivo do teto: uma frase boa volta em ~5s, um pedaço de 400
+ * caracteres em ~12s no 3.8. Curto de propósito — 4s + 15ms/caractere —: com a saúde dos modelos
+ * variando ao longo do dia, a segunda tentativa (no OUTRO modelo) precisa começar cedo, e não
+ * depois que a primeira já desperdiçou meio minuto pendurada.
+ */
+const TTS_HEDGE_BASE_MS = 4_000;
+const TTS_HEDGE_POR_CARACTERE_MS = 15;
+const TTS_HEDGE_MINIMO_MS = 6_000;
+const TTS_HEDGE_MAXIMO_MS = 12_000;
+export function hedgeDaVoz(caracteres) {
+  return Math.min(TTS_HEDGE_MAXIMO_MS, Math.max(TTS_HEDGE_MINIMO_MS, TTS_HEDGE_BASE_MS + caracteres * TTS_HEDGE_POR_CARACTERE_MS));
+}
+const TTS_TENTATIVAS = 3;
+
+/**
+ * Síntese com tentativas SOBREPOSTAS, e não em fila.
+ *
+ * A diferença em relação a withTransientRetry é essa: ali, a tentativa seguinte só começa
+ * depois de a anterior desistir. Aqui as tentativas convivem, e a primeira que responder ganha.
+ * Contra uma distribuição bimodal — ou volta rápido, ou nunca — é o que transforma o pior caso
+ * de "26s perdidos antes de começar de novo" em "16s até ter uma segunda chance rodando".
+ */
+async function sintetizarComHedge(text, voice) {
+  if (!KEYS.length) throw new Error("GEMINI_API_KEY (ou GEMINI_API_KEYS) não configurada.");
+
+  const tentadas = new Set();
+  const controladores = [];
+  const erros = [];
+  let jaVenceu = false;
+  const teto = tetoDaTentativaDeVoz(text.length);
+  const hedge = hedgeDaVoz(text.length);
+
+  // Cada tentativa num modelo diferente (principal, reserva, principal...): quando um modelo
+  // inteiro está sobrecarregado — o que acontece com o Google e não tem a ver com chave —, as
+  // três tentativas no mesmo modelo cairiam juntas.
+  let numero = 0;
+  const umaTentativa = async () => {
+    const modelo = TTS_MODELOS[numero++ % TTS_MODELOS.length];
+    const indice = await pickKeyIndex(KEYS.length, modelo, tentadas);
+    tentadas.add(indice);
+    const controlador = new AbortController();
+    controladores.push(controlador);
+    const relogio = setTimeout(() => controlador.abort(), teto);
+    try {
+      const r = await clientFor(KEYS[indice]).models.generateContent({
+        model: modelo,
+        contents: [{ parts: [{ text }] }],
+        config: {
+          responseModalities: ["AUDIO"],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+          abortSignal: controlador.signal,
+        },
+      });
+      await markOk(indice, modelo);
+      return r;
+    } catch (err) {
+      // Uma tentativa abortada PORQUE outra ganhou não diz nada sobre a chave dela. Marcar
+      // cooldown aqui tiraria de circulação uma chave boa a cada chamada bem-sucedida — o
+      // pool inteiro entraria em castigo sem nenhuma falha real ter acontecido.
+      if (!jaVenceu) {
+        const classificado = classifyGeminiError(err);
+        if (classificado.transient) {
+          await markCooldown(indice, modelo, {
+            untilMs: classificado.untilMs,
+            reason: classificado.reason,
+            error: err?.message || String(err),
+          });
+        }
+        erros.push({ err, indice, classificado });
+      }
+      throw err;
+    } finally {
+      clearTimeout(relogio);
+    }
+  };
+
+  const emVoo = [];
+  for (let i = 0; i < TTS_TENTATIVAS; i++) {
+    const p = umaTentativa();
+    p.catch(() => {}); // a perdedora rejeita ao ser abortada; sem isto vira rejeição não tratada
+    emVoo.push(p);
+
+    if (i === TTS_TENTATIVAS - 1) break;
+    const chegouAlguma = await Promise.race([
+      Promise.any(emVoo).then(() => true).catch(() => false),
+      new Promise((r) => setTimeout(() => r(false), hedge)),
+    ]);
+    if (chegouAlguma) break;
+  }
+
+  try {
+    const res = await Promise.any(emVoo);
+    jaVenceu = true;
+    for (const c of controladores) { try { c.abort(); } catch { /* já terminou */ } }
+    return res;
+  } catch {
+    const primeiro = erros[0];
+    if (primeiro) throw rewriteError(primeiro.err, primeiro.indice, primeiro.classificado);
+    throw new Error("TTS: todas as tentativas falharam");
+  }
+}
+
+/**
+ * Gera fala a partir de texto. `voiceName` (opcional) sobrescreve a voz padrão — vem do
+ * seletor de voz do Assistente (guardado no navegador, ver src/app/api/speak/route.js).
+ * Retorna { base64, sampleRate, mime } — o áudio como o modelo mandou: PCM cru (L16) ou um WAV
+ * inteiro, conforme o modelo. Quem toca precisa passar por pcmDoGemini (src/lib/audioDoGemini.js).
+ */
+export async function synthesizeSpeech(text, voiceName) {
+  const voice = TTS_VOICES.some((v) => v.name === voiceName) ? voiceName : DEFAULT_TTS_VOICE;
+  const res = await sintetizarComHedge(text, voice);
+
+  const part = res?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData);
+  const inline = part?.inlineData;
+  if (!inline?.data) throw new Error("TTS: resposta sem áudio");
+
+  // mime tipo "audio/L16;codec=pcm;rate=24000"
+  const rateMatch = /rate=(\d+)/.exec(inline.mimeType || "");
+  const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+
+  return { base64: inline.data, sampleRate, mime: inline.mimeType || "audio/L16" };
+}
+
+// ---- Modo Tela (proativo): vigília periódica da tela, ver /api/screen-comment ----
+// Instrução BASE — quem chama (a rota) decide se aplica withPersona() por cima antes de
+// passar pra cá, do mesmo jeito que já faz com o systemInstruction do chat normal (evita
+// import circular: rag.js já importa deste arquivo, então esse não pode importar de rag.js).
+export const SCREEN_WATCH_INSTRUCTION = `Você é a Lisa, observando a tela do usuário enquanto ele trabalha no computador, através de UMA captura de tela por vez (não é vídeo contínuo — a próxima só vem daqui a alguns minutos).
+
+Comente quando notar algo que valha a pena — e isso é mais amplo do que só problema:
+- um erro, aviso ou algo visivelmente travado/quebrado;
+- uma dica técnica genuína relacionada ao que está na tela (um atalho, uma forma mais rápida de fazer o que a pessoa está tentando, um detalhe fácil de passar batido);
+- algo interessante ou digno de um comentário espirituoso no seu estilo (você tem personalidade — pode ser direta, técnica e com humor, não só um robô de alerta de erro);
+- um padrão que valha observar (ex.: muitas abas de uma coisa só, algo repetido, progresso notável).
+
+Não precisa ser problema pra merecer um comentário. Evite só narrar o óbvio (descrever o que a pessoa já sabe que está fazendo) ou repetir um comentário parecido com o que você provavelmente já disse nas últimas capturas.
+
+Fique em silêncio de verdade (responda EXATAMENTE com a palavra NADA, maiúsculas, sem mais nada) quando a tela genuinamente não render nada — parada, vazia, ou sem nada de novo desde antes. Mas não seja reticente demais: se tiver algo real pra falar, fale. Quando falar, seja breve — 1 ou 2 frases, direta ao ponto, no seu estilo.`;
+
+// ---- Modo Observância (proativo): saudação pré-configurada, ver /api/camera-comment ----
+// Quem mora com o usuário vem da variável LISA_CASA, nunca do código: cada pessoa ou bicho
+// separado por ";", e o nome separado da descrição por "|". Exemplo:
+//   LISA_CASA="Ana|esposa do usuário;Pipoca|cachorra da família, vira-lata caramelo"
+// Sem a variável, a Lisa não cumprimenta ninguém pelo nome: só comenta o que for digno de nota.
+
+/** As pessoas e os bichos da casa, lidos de LISA_CASA: [{ nome, descricao }]. */
+export function moradoresDaCasa(texto = process.env.LISA_CASA) {
+  return String(texto || "")
+    .split(";")
+    .map((item) => {
+      const [nome, ...resto] = item.split("|");
+      return { nome: (nome || "").trim(), descricao: resto.join("|").trim() };
+    })
+    .filter((m) => m.nome)
+    .slice(0, 12);
+}
+
+/** A instrução do Modo Observância, com os moradores da casa (se houver). */
+export function instrucaoDaCamera(moradores = moradoresDaCasa()) {
+  const inicio = `Você é a Lisa, observando o usuário pela câmera (Modo Observância), através de UMA foto por vez (não é vídeo contínuo — a próxima só vem daqui a alguns segundos/minutos).`;
+  const fim = `Evite repetir um comentário parecido com o que você provavelmente já fez nas últimas capturas
+(ex.: já cumprimentou alguém há pouco e a pessoa continua simplesmente ali) — nesse caso prefira
+ficar em silêncio a repetir a mesma saudação.
+
+Fique em silêncio de verdade (responda EXATAMENTE com a palavra NADA, maiúsculas, sem mais
+nada) quando não houver nada digno de nota ou a foto estiver vazia/sem ninguém. Quando falar,
+seja breve — 1 ou 2 frases, no seu estilo.`;
+
+  if (!moradores.length) {
+    return `${inicio}
+
+Comente só quando houver algo genuinamente interessante, engraçado ou digno de nota sobre o que a
+câmera está vendo — com base no que aparece DE VERDADE na foto, nada genérico ou inventado. Não
+narre o óbvio (tipo "vejo uma pessoa sentada") e não tente adivinhar quem é cada pessoa.
+
+${fim}`;
+  }
+
+  const lista = moradores.map((m) => `- ${m.nome}${m.descricao ? `: ${m.descricao}` : ""}`).join("\n");
+  return `${inicio}
+
+Quem mora com o usuário (pode aparecer na câmera):
+${lista}
+
+Comportamento pré-configurado, sempre válido, nesta ordem de prioridade:
+1. Se você reconhecer, pela descrição, mais de um morador JUNTO na mesma foto, cumprimente todos
+   na mesma fala (não escolha só um), com base no que vê de verdade (estão juntos fazendo o quê?).
+   É UM comentário só, sobre a cena.
+2. Se você reconhecer um morador sozinho, cumprimente pelo nome, com carinho, e puxe papo com base
+   no que você vê DE VERDADE na foto (o que parece estar fazendo, expressão, ambiente) — nada
+   genérico ou inventado. Com uma pessoa, de vez em quando (não toda vez), dá para fazer uma
+   brincadeira bem-humorada sobre o usuário, no seu estilo, nunca cruel ou ofensiva de verdade.
+3. Na dúvida sobre quem é, não chute o nome: comente a cena sem identificar ninguém.
+4. Fora esses casos, siga o critério normal de "vale a pena comentar": algo genuinamente
+   interessante, engraçado ou digno de nota. Sem nenhum morador em quadro, seja mais seletiva —
+   não narre o óbvio (tipo "vejo uma pessoa sentada").
+
+${fim}`;
+}
+
+// ---- Modo Escuta (proativo): microfone realmente aberto, ver /api/mic-comment ----
+export const MIC_WATCH_INSTRUCTION = `Você é a Lisa, ouvindo o microfone do usuário através de pedacinhos curtos de áudio (uns 10 segundos cada, não é escuta contínua de verdade — o próximo pedaço só chega daqui a pouco).
+
+Comente quando notar algo que valha a pena — em especial:
+- se o usuário estiver CANTANDO (mesmo baixinho, só um trechinho, ou sem ter certeza absoluta
+  se é canto ou só fala cantarolada): SEMPRE comente — dê um feedback genuíno e específico
+  sobre COMO ele está cantando NESTE trecho (afinação, ritmo, energia, projeção) — seja
+  honesta mas gentil, no seu estilo, e ESPECÍFICA sobre o que ouviu ("tá bom" sozinho não
+  vale). Na dúvida entre comentar ou ficar em silêncio quando parecer canto, ERRE pro lado de
+  comentar — é bem pior ficar quieta enquanto alguém canta pra você do que comentar um
+  trechinho curto ou incerto. NUNCA tente adivinhar ou afirmar QUAL música é — você não tem
+  como reconhecer uma música de verdade só ouvindo alguém cantar a cappella (é bem diferente
+  de identificar uma gravação original tocando), e já inventou um título errado com confiança
+  antes. Fale só sobre COMO a pessoa canta, nunca sobre qual é a música;
+- alguém tocando um instrumento;
+- uma conversa ou som genuinamente interessante, engraçado ou digno de comentário;
+- um som que pareça um problema (choro, algo caindo, alarme).
+
+Não comente sobre fala comum de trabalho/reunião a não ser que tenha algo realmente digno de nota — não narre o óbvio nem transcreva o que foi dito.
+
+Fique em silêncio de verdade (responda EXATAMENTE com a palavra NADA, maiúsculas, sem mais
+nada) SÓ quando o áudio for silêncio genuíno, ruído de fundo comum, ou claramente nada que
+mereça comentário — nunca use NADA como resposta padrão só por insegurança. Canto ou música
+tocando SEMPRE merece um comentário, mesmo que curto/incerto. Quando falar, seja breve — 1 ou
+2 frases, direta, no seu estilo.`;
+
+/**
+ * Analisa UM pedaço curto de ÁUDIO (Modo Escuta) e decide se vale comentar algo — mesmo
+ * padrão de describeScreenIfNotable, mas com um Part de áudio (inlineData) em vez de imagem.
+ * `audio` = { mimeType, data } — mimeType precisa ser um formato que o Gemini reconheça de
+ * verdade (ex.: "audio/wav"); testado direto contra a API antes de usar em produção.
+ */
+export async function describeAudioIfNotable(audio, systemInstruction = MIC_WATCH_INSTRUCTION) {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: "Aqui está o áudio dos últimos segundos." }, { inlineData: { mimeType: audio.mimeType, data: audio.data } }] }],
+        config: { systemInstruction },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+  const text = (res.text || "").trim();
+  if (!text || /^nada\.?$/i.test(text)) return null;
+  return text;
+}
+
+// ---- Modo Tomar nota: ver src/components/panels/TomarNota.js e /api/notas/* ----
+
+const SEM_FALA = "SEM_FALA";
+
+/**
+ * Transcreve UM trecho (~30 s) do Modo Tomar nota, ao pé da letra. O tema e o fim do trecho
+ * anterior vão junto só para o modelo acertar nomes e termos do assunto e não repetir a
+ * palavra cortada na emenda — a transcrição continua sendo do que foi DITO, não do tema.
+ * Devolve "" quando o trecho não tem fala.
+ */
+export async function transcreverTrechoDeNota(audio, { tema = "", anterior = "" } = {}) {
+  const contexto = [
+    tema ? `Assunto da gravação: ${tema}.` : "",
+    anterior ? `Final do trecho anterior (só para continuidade, NÃO repita): "…${anterior}"` : "",
+  ].filter(Boolean).join("\n");
+  const systemInstruction = `Você transcreve áudio em português do Brasil, ao pé da letra.
+- Escreva exatamente o que foi falado, na ordem, com pontuação. Não resuma, não corrija o conteúdo, não comente.
+- O áudio é um trecho de uma gravação maior: pode começar ou terminar no meio de uma palavra. Transcreva só o que der para entender.
+- Trecho que não dá para entender: [inaudível]. Quando outra pessoa começa a falar, comece a fala dela numa linha nova com "— ".
+- Não escreva marcações de tempo, nomes de quem fala nem nada que não foi falado. Silêncio, respiração e ruído não viram palavra: nunca complete com "tchau", "obrigado" ou algo parecido que não foi dito.
+- Se não houver fala nenhuma (silêncio, ruído, música sem letra), responda exatamente: ${SEM_FALA}`;
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo, abortSignal) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `${contexto}\nTranscreva este trecho.`.trim() }, { inlineData: { mimeType: audio.mimeType, data: audio.data } }] }],
+        config: { systemInstruction, temperature: 0, ...(abortSignal ? { abortSignal } : {}) },
+      }),
+    { attempts: 2, delayMs: 800, tetoMs: 30_000 }
+  );
+  const texto = limparTranscricao(res.text);
+  return !texto || texto.includes(SEM_FALA) ? "" : texto;
+}
+
+/**
+ * Organiza a transcrição inteira do Modo Tomar nota em notas por assunto. O tema filtra: o
+ * que não tem a ver com ele (conversa paralela, interrupção) fica de fora. As citações têm de
+ * ser copiadas da transcrição — é o que deixa a interpretação conferível no card.
+ */
+export async function organizarNotas({ tema = "", transcricao, duracaoMin }) {
+  const systemInstruction = `Você é a Lisa no modo "Tomar nota": ouviu uma gravação de ${duracaoMin} min e agora transforma o que ouviu em notas para um quadro do Abacato.
+- ${tema ? `O tema é "${tema}". Use o tema como filtro: deixe de fora o que não tem relação com ele (conversa paralela, interrupção, ruído).` : `Não foi informado um tema: deduza um tema curto (até 6 palavras). Se a pessoa disse o assunto no começo ("o assunto é…", "vamos falar de…"), use isso.`}
+- Quebre o conteúdo em notas por SUBASSUNTO dentro do tema: cada nota cobre um assunto só. Assunto que voltou várias vezes na gravação vira UMA nota. Normalmente de 2 a 8 notas; uma só se a gravação inteira foi sobre um ponto.
+- titulo: curto (até 70 caracteres), específico, que se entenda sem abrir o card.
+- interpretacao: a SUA leitura do que foi dito, em 2 a 5 frases — o que significa, o que foi decidido, o que ficou em aberto. Separe o que foi dito do que você está deduzindo ("parece que…").
+- pontos: os fatos, números, nomes e argumentos importantes, um por item.
+- encaminhamentos: tarefas, decisões e próximos passos mencionados (com quem e quando, se foi dito). Vazio se não houve.
+- citacoes: trechos COPIADOS da transcrição, sem mudar nenhuma palavra, que sustentam a nota. De 1 a 6 por nota.
+- resumo: 1 ou 2 frases sobre a gravação inteira.
+- Escreva em português do Brasil. Não invente nada que não esteja na transcrição.`;
+  // Em stream: 10 minutos de transcrição levam bem mais que o teto para sair inteiros (2 min
+  // levaram 39 s no teste de 27/10/2026). Assim o teto mede só o início da resposta.
+  const stream = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo, abortSignal) =>
+      client.models.generateContentStream({
+        model: modelo,
+        contents: `TRANSCRIÇÃO (cada linha começa com o minuto da gravação):\n\n${transcricao}`,
+        config: {
+          systemInstruction,
+          temperature: 0.3,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              tema: { type: "STRING" },
+              resumo: { type: "STRING" },
+              notas: {
+                type: "ARRAY",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    titulo: { type: "STRING" },
+                    interpretacao: { type: "STRING" },
+                    pontos: { type: "ARRAY", items: { type: "STRING" } },
+                    encaminhamentos: { type: "ARRAY", items: { type: "STRING" } },
+                    citacoes: { type: "ARRAY", items: { type: "STRING" } },
+                  },
+                  required: ["titulo", "interpretacao", "pontos", "citacoes"],
+                  propertyOrdering: ["titulo", "interpretacao", "pontos", "encaminhamentos", "citacoes"],
+                },
+              },
+            },
+            required: ["tema", "resumo", "notas"],
+            propertyOrdering: ["tema", "resumo", "notas"],
+          },
+          ...(abortSignal ? { abortSignal } : {}),
+        },
+      }),
+    { attempts: 2, delayMs: 1000, tetoMs: 60_000 }
+  );
+  let texto = "";
+  for await (const parte of stream) texto += parte.text || "";
+  const r = JSON.parse(texto);
+  return {
+    tema: String(r?.tema || tema || "").trim(),
+    resumo: String(r?.resumo || "").trim(),
+    notas: (Array.isArray(r?.notas) ? r.notas : []).filter((n) => n?.titulo),
+  };
+}
+
+/**
+ * Analisa UMA imagem (captura de tela OU foto da câmera) e decide se vale comentar algo —
+ * usado pelo modo proativo (a pessoa NÃO perguntou nada, é a Lisa "de olho" sozinha). Chamada
+ * não-streaming, simples e barata de propósito (é chamada periodicamente, sem interação do
+ * usuário). `label` é só a legenda enviada junto da imagem (varia conforme a origem — tela ou
+ * câmera — pra o modelo entender o que está vendo).
+ *
+ * Retorna o comentário (string) ou null quando não há nada digno de nota.
+ */
+export async function describeScreenIfNotable(image, systemInstruction = SCREEN_WATCH_INSTRUCTION, label = "Aqui está a tela agora.") {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: label }, { inlineData: { mimeType: image.mimeType, data: image.data } }] }],
+        config: { systemInstruction },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+  const text = (res.text || "").trim();
+  if (!text || /^nada\.?$/i.test(text)) return null;
+  return text;
+}
+
+// ---- Modo Assistente de Testes: ver src/lib/sentinelTests.js e /api/test-mode/* ----
+
+/**
+ * Compara UMA ou mais imagens da tela (o teste sendo executado ao vivo) com os PASSOS e o
+ * CRITÉRIO DE APROVAÇÃO de um caso de teste (vindos de cloud_runs.state — a aplicação de
+ * controle de testes do usuário), e dá um veredito. Deliberadamente CONSERVADORA: só devolve
+ * "Aprovado"/"Reprovado" quando a evidência na tela é clara o bastante; caso contrário devolve
+ * "indeterminado" — errar dizendo "não sei" é sempre melhor que aprovar/reprovar um teste
+ * errado, já que isso pode escrever de volta no sistema de testes de verdade.
+ */
+export async function evaluateTestCase({ itemTestado, descricao, condicaoAprovacao, images = [] }) {
+  const prompt = `ITEM TESTADO: ${itemTestado || "(não informado)"}
+
+PASSOS DO TESTE:
+${descricao || "(não informado)"}
+
+CRITÉRIO DE APROVAÇÃO:
+${condicaoAprovacao || "(não informado)"}
+
+As imagens anexadas são capturas de tela em ORDEM CRONOLÓGICA (da mais antiga pra mais
+recente) — não é só o instante atual, é o HISTÓRICO de momentos já observados ao longo da
+execução deste teste até agora (login, navegação, edição, resultado final etc., cada um pode
+ter sido capturado numa hora diferente). Junte a informação de TODAS elas — um passo
+confirmado numa imagem mais antiga continua valendo mesmo que não apareça mais na imagem mais
+recente. Avalie o critério de aprovação considerando a sequência INTEIRA, não só a última foto.`;
+
+  const systemInstruction = `Você é a Lisa, ajudando alguém a executar um caso de teste, olhando capturas da tela dele
+tiradas em momentos diferentes ao longo da execução (não é vídeo contínuo — são fotos
+espaçadas no tempo, em ordem). Sua função é reconstruir a SEQUÊNCIA do que já aconteceu a
+partir de todas as imagens juntas e comparar com o CRITÉRIO DE APROVAÇÃO do caso — mas seja
+CONSERVADORA: só diga "Aprovado" ou "Reprovado" quando a sequência de imagens mostrar evidência
+clara o bastante pra sustentar aquilo. Se ainda faltar ver alguma etapa (nenhuma imagem cobre
+aquele momento ainda), diga "indeterminado" e explique especificamente qual etapa falta —
+nunca chute. Isso pode ser gravado de volta no sistema de testes de verdade, então um veredito
+errado tem custo real.
+
+No campo "reasoning" (2-4 frases, em português, no seu estilo, direta): explique o que a
+SEQUÊNCIA de imagens mostra e por que isso confirma, contraria, ou ainda não é suficiente pra
+avaliar o critério.`;
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{
+          role: "user",
+          parts: [
+            { text: prompt },
+            ...images.map((img) => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
+          ],
+        }],
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              verdict: { type: "STRING", enum: ["Aprovado", "Reprovado", "indeterminado"] },
+              reasoning: { type: "STRING" },
+            },
+            required: ["verdict", "reasoning"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 600, tetoMs: TETO_LONGO_MS }
+  );
+
+  try {
+    const parsed = JSON.parse(res.text);
+    return { verdict: parsed.verdict || "indeterminado", reasoning: parsed.reasoning || "" };
+  } catch {
+    return { verdict: "indeterminado", reasoning: "não consegui interpretar a resposta do modelo desta vez." };
+  }
+}
+
+// ---- Modo Vigia: ver src/lib/screenWatch.js e /api/screen-watch/* ----
+// Memória das observações reais do Modo Tela (só quando ela realmente comentou algo, nunca
+// "nada digno de nota") — dois usos: responder pergunta sob demanda (qualquer dispositivo) e
+// narrar sozinha de tempos em tempos o que mudou desde a última vez (proativo, também de
+// qualquer dispositivo — não depende da tela estar sendo compartilhada NAQUELE aparelho).
+
+export const VIGIA_ASK_INSTRUCTION = `Você é a Lisa. O usuário está te perguntando sobre o que você vem observando na tela dele através do Modo Tela — mas você NÃO está vendo a tela agora nesta pergunta, só tem acesso ao HISTÓRICO de comentários reais que você já fez sobre ela (cada um com o horário).
+
+Responda com base SÓ nesse histórico, no seu estilo (direta, com personalidade). Se o histórico estiver vazio ou não tiver nada relacionado à pergunta, diga isso claramente — nunca invente uma observação que não está na lista. Seja breve, apropriado pra fala em voz alta.`;
+
+/** Responde uma pergunta sobre o HISTÓRICO de observações (não a tela ao vivo) — usado pelo
+ * Modo Vigia sob demanda, de qualquer dispositivo. `rows` = [{comment, created_at}], já em
+ * ordem cronológica. Sempre responde algo (nunca null) — mesmo que seja "não tenho registro
+ * disso ainda". */
+export async function answerAboutScreenHistory(question, rows, systemInstruction = VIGIA_ASK_INSTRUCTION) {
+  const historyText = rows.length
+    ? rows.map((r) => `[${new Date(r.created_at).toLocaleString("pt-BR")}] ${r.comment}`).join("\n")
+    : "(nenhuma observação registrada ainda)";
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `HISTÓRICO DE OBSERVAÇÕES DA TELA:\n${historyText}\n\nPERGUNTA: ${question}` }] }],
+        config: { systemInstruction },
+      }),
+    { attempts: 2, delayMs: 600 }
+  );
+  return (res.text || "").trim() || "Não consegui pensar em uma resposta pra isso agora.";
+}
+
+export const VIGIA_DIGEST_INSTRUCTION = `Você é a Lisa, narrando pro usuário — de tempos em tempos, PROATIVAMENTE, sem ele ter perguntado nada — o que você notou de novo na tela dele desde a última vez que contou, através do Modo Tela (Transmissão ligada). Você recebe só os comentários NOVOS desde então (cada um com o horário).
+
+Sintetize num resumo curto e falado (não liste um por um mecanicamente) — 1 a 3 frases, no seu estilo. Se os itens novos forem repetitivos ou pouco relevantes pra valer a pena interromper o usuário, fique em silêncio de verdade (responda EXATAMENTE com a palavra NADA, maiúsculas, sem mais nada).`;
+
+/** Narra (ou não) o que há de novo desde a última checagem — usado pelo Modo Vigia proativo.
+ * `rows` = só as observações NOVAS (sinceId), em ordem cronológica. Retorna null quando não
+ * vale a pena falar (a maioria das checagens, se nada novo aconteceu ou o que houve é
+ * irrelevante). */
+export async function summarizeNewScreenActivity(rows, systemInstruction = VIGIA_DIGEST_INSTRUCTION) {
+  if (!rows.length) return null;
+  const newText = rows.map((r) => `[${new Date(r.created_at).toLocaleString("pt-BR")}] ${r.comment}`).join("\n");
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `NOVO DESDE A ÚLTIMA VEZ:\n${newText}` }] }],
+        config: { systemInstruction },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+  const digestText = (res.text || "").trim();
+  if (!digestText || /^nada\.?$/i.test(digestText)) return null;
+  return digestText;
+}
+
+// ---- Câmera de Vigia: ver src/lib/screenShareRTC.js e assistant/page.js (onChatMessage) ----
+
+export const VIGIA_CAMERA_CHAT_INSTRUCTION = `Você é a Lisa. Alguém está assistindo AO VIVO a câmera de vigia de outro dispositivo (tipo uma babá eletrônica) e mandou uma mensagem de texto pra você ler em voz alta pra quem estiver perto dessa câmera.
+
+NÃO repita a mensagem palavra por palavra como um robô lendo em voz alta — interprete o que a pessoa quis dizer e fale isso com naturalidade, no seu estilo, como se você mesma estivesse ali avisando/comentando. Seja breve (1 frase, no máximo duas), apropriado pra ser ouvido em voz alta por quem está perto da câmera.`;
+
+/** Interpreta uma mensagem mandada por quem assiste a Câmera de Vigia e devolve o que a Lisa
+ * deve FALAR (não a mensagem crua) — sempre retorna algo (a pessoa mandou de propósito, merece
+ * resposta). Fala pelo MESMO pipeline de voz das respostas normais (/api/speak), garantindo a
+ * mesma voz configurada, nunca uma voz de reserva diferente. */
+export async function interpretVigiaChatMessage(text, systemInstruction = VIGIA_CAMERA_CHAT_INSTRUCTION) {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `MENSAGEM RECEBIDA: ${text}` }] }],
+        config: { systemInstruction },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+  return (res.text || "").trim() || text;
+}
+
+// ---- Lisa Code: extensão pessoal do VS Code (ver src/app/api/lisa-code/*) ----
+// A Lisa dentro do editor, com permissão de ler e PROPOR mudanças no código do usuário. O
+// código de ler/escrever arquivo de verdade roda só NO CLIENTE (a extensão) — a função da
+// Vercel não tem acesso ao disco do usuário. Este servidor só decide, turno a turno, o que a
+// Lisa quer fazer a seguir (falar, ler um arquivo, propor uma edição, consultar as
+// funcionalidades da Lisa) via function calling nativo do Gemini, e devolve isso cru pro
+// cliente executar — quem mantém o histórico da conversa e executa as ferramentas é sempre a
+// extensão, nunca este módulo.
+export const LISA_CODE_INSTRUCTION = `Você é a Lisa, agora rodando como uma extensão dentro do VS Code do seu usuário — uma ferramenta PESSOAL dele, ninguém mais tem acesso a ela. Você pode ler e propor mudanças no código que ele está trabalhando, além de responder usando dados reais da Lisa (Abacato, Tarefas do trabalho, Sentinela, Pensamentos).
+
+REGRAS IMPORTANTES:
+- Você NUNCA escreve, cria ou apaga um arquivo diretamente — sempre usa propose_edit, create_file ou delete_file, que mostram a mudança pro usuário aprovar ou rejeitar antes de qualquer coisa tocar o disco de verdade.
+- Antes de propor uma edição num arquivo que você ainda não viu NESTA conversa, use read_file pra ler o conteúdo atual — nunca "adivinhe" o que já está no arquivo.
+- Use get_problems quando o usuário perguntar sobre erros/avisos do código, ou antes de propor uma correção — ela só reflete o que o VS Code já analisou (normalmente arquivos abertos), não é uma varredura nova do projeto inteiro.
+- Use search_workspace pra achar onde algo aparece no projeto (uma função, uma variável, um texto) antes de mexer — é busca de TEXTO LITERAL (não é regex).
+- Use list_pending_work só quando o usuário perguntar algo relacionado a tarefas/chamados/pensamentos, e narre só o que a ferramenta devolver — nunca invente números ou itens.
+- Você pode criar branch (create_branch), commitar (git_commit) e dar push (git_push) — todas pedem confirmação do usuário antes de agir. Regras: só commite arquivos que VOCÊ realmente mexeu nesta conversa, listando cada um explicitamente (não existe "commitar tudo"); nunca inclua arquivo de segredo/credencial (.env, chave, token) num commit; e nunca dê push sem o usuário ter pedido, especialmente na branch principal — ali o push dispara deploy de PRODUÇÃO. Se o trabalho merece branch própria, sugira create_branch antes de commitar na principal.
+- Use get_git_context quando o assunto envolver branch, "o que eu mudei", ou comparação com outra branch. A mensagem do usuário pode vir com um bloco "[contexto do editor]" no começo, dizendo qual arquivo está aberto, a linha do cursor, o trecho selecionado e a branch de comparação escolhida — use isso pra saber onde ele está sem perguntar, mas não repita esse bloco de volta pra ele.
+- SEMPRE narre em texto, ANTES de cada ferramenta que for chamar, uma frase curta (1 linha) dizendo o que vai fazer e em qual arquivo/onde — nunca chame uma ferramenta em silêncio, sem explicar antes o que está prestes a fazer.
+- Em qualquer tarefa de CÓDIGO que vá precisar de mais de uma ferramenta (ex.: ler + editar, ou editar vários arquivos), chame report_progress logo no início com uma estimativa de quantas etapas o trabalho vai ter, e chame de novo a cada etapa concluída, atualizando o percentual. Sempre feche em percent:100 quando a tarefa acabar de verdade (inclusive se o usuário rejeitar uma proposta — feche o ciclo mesmo assim). Isso é uma ESTIMATIVA sua, não uma medição exata — não precisa ser perfeita, só dar uma noção real de progresso. Não use isso pra perguntas simples que não envolvem mexer em código.
+- Para DOCUMENTAR: use find_undocumented primeiro, nunca proponha às cegas. Se não faltar nada, diga isso e pare — este repositório é comentado com cuidado, e reescrever comentário bom é pior que não fazer nada. Quando faltar, siga o estilo da CASA, que não é JSDoc genérico: explique o PORQUÊ da decisão (não o que o código obviamente faz), cite a medição ou o bug real que motivou aquilo quando houver, e prefira uma frase que evite um erro futuro a uma lista de @param. Um exemplo de uso vale mais que três linhas de tipos — se precisar de um, use search_workspace para achar quem já chama a função e escreva o exemplo a partir do uso REAL.
+- A mensagem do usuário pode trazer, dentro do bloco "[contexto do editor]", uma seção "[da Lisa, relacionado ao arquivo aberto]" com cards, tarefas, chamados ou pensamentos que têm a ver com o arquivo que ele está editando. Isso chega SOZINHO, sem ele pedir — use quando ajudar ("vi que tem um card sobre isso...") e ignore quando não vier ao caso. Nunca repita o bloco de volta para ele, e nunca invente item que não esteja ali.
+- Você pode rodar comandos no terminal com run_command e LER a saída — use isso em vez de perguntar ao usuário o que deu: rode os testes, confira o build, veja a versão instalada. Um comando de cada vez, sem encadear com ; && | ou > (encadear força confirmação e atrasa). Se um comando falhar, a saída vem junto: leia o erro e conserte, não repita o mesmo comando esperando outro resultado. Essa ferramenta pode estar desligada; se vier um erro dizendo isso, siga sem ela em vez de insistir.
+- Seja direta e técnica quando o assunto for código (você está ajudando um desenvolvedor dentro do editor dele), mas mantenha seu jeito de ser nas outras conversas.`;
+
+const LISA_CODE_TOOLS = [
+  {
+    functionDeclarations: [
+      {
+        name: "read_file",
+        description: "Lê o conteúdo atual de um arquivo do workspace aberto no VS Code do usuário. Use antes de propor qualquer edição num arquivo que você ainda não viu nesta conversa.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: { path: { type: "string", description: "Caminho do arquivo, relativo à raiz do workspace" } },
+          required: ["path"],
+        },
+      },
+      {
+        name: "propose_edit",
+        description: "Propõe uma mudança de código num arquivo — o usuário vê um diff e decide se aplica ou rejeita. Nunca escreve no disco sozinho.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Caminho do arquivo, relativo à raiz do workspace" },
+            newContent: { type: "string", description: "Conteúdo COMPLETO do arquivo depois da mudança (o arquivo inteiro, não um diff)" },
+            explanation: { type: "string", description: "Explicação curta (1-2 frases) do que mudou e por quê" },
+          },
+          required: ["path", "newContent", "explanation"],
+        },
+      },
+      {
+        name: "list_pending_work",
+        description: "Consulta itens REAIS e pendentes da Lisa — nunca invente dados, só narre o que essa ferramenta devolver.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: { source: { type: "string", enum: ["trello", "work", "sentinel", "thoughts"] } },
+          required: ["source"],
+        },
+      },
+      {
+        name: "get_problems",
+        description: "Lê os erros e avisos do Problems panel do VS Code (lint, TypeScript, etc.) — só reflete o que o VS Code já analisou até agora, não roda uma varredura nova.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: { path: { type: "string", description: "Opcional — caminho de um arquivo específico. Sem isso, traz de todo o workspace." } },
+          required: [],
+        },
+      },
+      {
+        name: "search_workspace",
+        description: "Busca um texto LITERAL (não é regex) em vários arquivos do workspace — use pra achar onde uma função/variável/trecho aparece antes de editar algo.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Texto exato a procurar" },
+            glob: { type: "string", description: "Opcional — filtro de arquivos, ex.: \"**/*.ts\". Sem isso, busca em todo o workspace." },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "create_file",
+        description: "Propõe criar um arquivo novo — o usuário confirma antes de qualquer coisa ser escrita no disco. Falha se o arquivo já existir (use propose_edit pra alterar um existente).",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Caminho do novo arquivo, relativo à raiz do workspace" },
+            content: { type: "string", description: "Conteúdo inicial completo do arquivo" },
+            explanation: { type: "string", description: "Explicação curta (1-2 frases) do porquê desse arquivo" },
+          },
+          required: ["path", "content", "explanation"],
+        },
+      },
+      {
+        name: "delete_file",
+        description: "Propõe apagar um arquivo — o usuário confirma antes de qualquer coisa acontecer. Vai pra lixeira do sistema, não é apagado de forma permanente.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Caminho do arquivo a apagar, relativo à raiz do workspace" },
+            explanation: { type: "string", description: "Explicação curta (1-2 frases) do porquê apagar" },
+          },
+          required: ["path", "explanation"],
+        },
+      },
+      {
+        name: "get_git_context",
+        description: "Lê o estado do Git do workspace (somente leitura — nunca faz checkout nem commit): branch atual, branches locais, arquivos modificados, e o que difere de uma branch de comparação. Use quando o assunto envolver 'o que eu mudei', branch, ou comparar com outra branch.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            base: { type: "string", description: "Opcional — branch pra comparar. Sem isso, usa a branch de comparação que o usuário escolheu na barra de contexto do painel." },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "create_branch",
+        description: "Cria uma branch nova a partir do HEAD atual e muda pra ela. O usuário confirma antes. Use quando for começar um trabalho que merece branch própria — nunca commite direto na principal sem o usuário pedir.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Nome da branch, ex.: \"fix/prazo-atrasado\"" },
+            reason: { type: "string", description: "Motivo curto — aparece no diálogo de confirmação" },
+          },
+          required: ["name"],
+        },
+      },
+      {
+        name: "git_commit",
+        description: "Faz stage APENAS dos arquivos listados e commita. O usuário vê a lista completa e a mensagem antes de confirmar. Liste explicitamente os arquivos — nunca existe 'commitar tudo'.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            files: { type: "array", items: { type: "string" }, description: "Caminhos exatos (relativos à raiz) que entram no commit — só os que você realmente mexeu" },
+            message: { type: "string", description: "Mensagem do commit, no estilo do histórico do projeto" },
+          },
+          required: ["files", "message"],
+        },
+      },
+      {
+        name: "git_push",
+        description: "Envia a branch atual pro remoto. O usuário confirma num diálogo que mostra branch, remoto e — se for a branch principal — o aviso de que isso dispara deploy de PRODUÇÃO. Nunca faz force push.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            reason: { type: "string", description: "Motivo curto — aparece no diálogo de confirmação" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "find_undocumented",
+        description:
+          "Lista o que um arquivo EXPORTA sem nenhuma explicação acima — função, classe ou constante. " +
+          "Use ANTES de propor documentação: ela transforma 'documente este arquivo' numa lista concreta e " +
+          "evita reescrever comentário que já está bom. Se a lista vier vazia, diga que o arquivo já está " +
+          "documentado e NÃO proponha mudança nenhuma.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: { path: { type: "string", description: "Caminho do arquivo, relativo à raiz do workspace" } },
+          required: ["path"],
+        },
+      },
+      {
+        name: "run_command",
+        description:
+          "Roda um comando no terminal do workspace do usuário e devolve a saída para você ler. " +
+          "Use para o que você não consegue saber de outro jeito: rodar os testes, conferir se o build passa, " +
+          "ver a versão de um pacote, listar arquivos de uma pasta grande. " +
+          "Comandos de rotina rodam direto; qualquer outro abre uma confirmação para o usuário, então NÃO tente " +
+          "contornar a lista encadeando comandos (; && | >) — isso força confirmação e atrasa o trabalho. " +
+          "Um comando que sai com erro devolve a saída normalmente: um teste que falhou é informação, não acidente.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "O comando exato, um só, sem encadeamento" },
+            explanation: { type: "string", description: "Uma frase dizendo por que você precisa rodar isso" },
+            onde: {
+              type: "string",
+              enum: ["aqui", "casa"],
+              description:
+                "Onde rodar. 'aqui' (padrão) é a máquina do usuário, onde está o código que ele edita. " +
+                "'casa' é o servidor dele — use quando o comando for demorado, pesado ou arriscado, porque " +
+                "lá um erro não atrapalha o trabalho dele. Em 'casa' NÃO existe confirmação: o que não está " +
+                "na lista de liberados simplesmente não roda.",
+            },
+          },
+          required: ["command", "explanation"],
+        },
+      },
+      {
+        name: "report_progress",
+        description: "Atualiza o progresso estimado de uma tarefa de código com várias etapas — chame cedo com uma estimativa, e de novo a cada etapa concluída. Sempre termine em percent:100 quando a tarefa acabar. É a SUA estimativa, não uma medição exata.",
+        parametersJsonSchema: {
+          type: "object",
+          properties: {
+            percent: { type: "number", description: "0 a 100 — quanto da tarefa você estima já ter concluído" },
+            status: { type: "string", description: "Frase curta do status atual, ex.: \"Etapa 2 de 4: editando o endpoint da API\"" },
+          },
+          required: ["percent", "status"],
+        },
+      },
+    ],
+  },
+];
+
+/** Um turno da conversa da Lisa Code — recebe o histórico COMPLETO (`contents`, já incluindo
+ * qualquer chamada/resposta de função de turnos anteriores) e devolve só o próximo turno cru do
+ * modelo (texto e/ou chamadas de função). Quem gerencia o histórico e EXECUTA as ferramentas é
+ * sempre quem chama (a extensão do VS Code) — este servidor nunca toca em arquivo nenhum. */
+export async function runLisaCodeTurn(contents, { provedor = "gemini" } = {}) {
+  // A extensão escolhe o provedor a cada turno (configuração lisaCode.modelo). Deixar a
+  // escolha vir do cliente, e não de uma variável do servidor, é o que permite trocar no meio
+  // de uma tarde sem republicar nada — foi o pedido.
+  //
+  // A conversa NÃO é traduzida de um lado para o outro no meio do caminho: o histórico vive
+  // no formato do Gemini, sempre, e a tradução acontece a cada turno. Trocar de provedor com
+  // uma conversa em andamento funciona por causa disso.
+  if (provedor === "groq") {
+    const { turnoNaGroq } = await import("./groq.js");
+    return turnoNaGroq(contents, { instrucao: LISA_CODE_INSTRUCTION, ferramentas: LISA_CODE_TOOLS });
+  }
+
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo, abortSignal) =>
+      client.models.generateContent({
+        model: modelo,
+        contents,
+        config: { systemInstruction: LISA_CODE_INSTRUCTION, tools: LISA_CODE_TOOLS, ...(abortSignal ? { abortSignal } : {}) },
+      }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_LONGO_MS }
+  );
+  const candidate = res.candidates?.[0];
+  return candidate?.content || { role: "model", parts: [{ text: res.text || "" }] };
+}
+
+// ---- Modo Quiz (ver /api/quiz/* e LisaQuiz.js) ----
+// A Lisa monta a pergunta E a explicação/recomendação. As perguntas são GERADAS em vez de vir
+// de um banco fixo: um banco esgotaria rápido, e assim ela varia dificuldade e assunto de
+// verdade. O schema estruturado garante que sempre venham 4 alternativas e um índice válido —
+// sem isso a interface teria que adivinhar o formato do texto dela.
+export const QUIZ_CATEGORY_LABELS = {
+  python: "Python",
+  javascript: "JavaScript",
+  java: "Java",
+  csharp: "C#",
+  cpp: "C++",
+  geral: "programação em geral (lógica, algoritmos, arquitetura, boas práticas)",
+};
+
+const QUIZ_INSTRUCTION = `Você é a Lisa, aplicando um quiz de programação pro seu usuário — você é boa nisso e gosta de ensinar, não de humilhar.
+
+REGRAS:
+- A pergunta tem que ser REAL e verificável, com UMA alternativa inequivocamente correta e 3 erradas plausíveis (nada de alternativa absurda que se elimina de graça).
+- Respeite a dificuldade pedida: "facil" é conceito básico do dia a dia; "medio" exige entender comportamento da linguagem; "dificil" pega pegadinha real, detalhe de especificação, ou consequência sutil de design.
+- Nada de pergunta ambígua, dependente de versão sem dizer a versão, ou de opinião.
+- A explicação diz POR QUE a correta está correta E por que a escolhida (se errada) parece certa mas não é — é isso que ensina.
+- A recomendação de estudo é concreta e curta: o tópico exato pra revisar, não "estude mais".
+- Escreva em português do Brasil. Pode ter código nas alternativas.`;
+
+/** Uma pergunta de quiz. `explanation`/`recommendation` já vêm prontas pra ela comentar depois
+ * de você responder — pedimos tudo de uma vez pra não gastar duas chamadas por pergunta. */
+export async function generateQuizQuestion({ category, difficulty, avoid = [] }) {
+  const label = QUIZ_CATEGORY_LABELS[category] || category;
+  const avoidText = avoid.length ? `\n\nNÃO repita nenhuma destas perguntas já feitas:\n${avoid.map((q) => `- ${q}`).join("\n")}` : "";
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: `Assunto: ${label}\nDificuldade: ${difficulty}${avoidText}`,
+        config: {
+          systemInstruction: QUIZ_INSTRUCTION,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              question: { type: "STRING" },
+              options: { type: "ARRAY", items: { type: "STRING" } },
+              correctIndex: { type: "INTEGER" },
+              explanation: { type: "STRING" },
+              recommendation: { type: "STRING" },
+            },
+            required: ["question", "options", "correctIndex", "explanation", "recommendation"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 800 }
+  );
+
+  const parsed = JSON.parse(res.text);
+  // valida o que veio: índice fora da faixa ou menos de 2 alternativas quebraria a tela
+  if (!Array.isArray(parsed?.options) || parsed.options.length < 2) throw new Error("o modelo não devolveu alternativas válidas");
+  const idx = Number(parsed.correctIndex);
+  if (!Number.isInteger(idx) || idx < 0 || idx >= parsed.options.length) throw new Error("índice da resposta correta inválido");
+
+  // Pergunta com código costuma voltar com "\n" LITERAL (barra + n) em vez de quebra de linha
+  // de verdade — visto na prática. Sem desescapar, o código apareceria numa linha só cheia de
+  // "\n" no meio, e a pergunta ficava ilegível.
+  const unescape = (t) => (typeof t === "string" ? t.replace(/\\n/g, "\n").replace(/\\t/g, "  ") : t);
+  return {
+    question: unescape(parsed.question),
+    options: parsed.options.map(unescape),
+    correctIndex: idx,
+    explanation: unescape(parsed.explanation),
+    recommendation: unescape(parsed.recommendation),
+  };
+}
+
+/** Comentário dela DEPOIS de você responder — usa a explicação que já veio com a pergunta, mas
+ * reescrita reagindo ao que você marcou (acertou/errou), no jeito dela. */
+export async function commentQuizAnswer({ question, chosen, correct, wasCorrect, explanation, recommendation }) {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: `Pergunta: ${question}\nEle marcou: ${chosen}\nCorreta: ${correct}\nAcertou? ${wasCorrect ? "sim" : "não"}\n\nExplicação técnica: ${explanation}\nRecomendação: ${recommendation}\n\nComente em no máximo 3 frases, no seu estilo: diga se acertou ou errou, POR QUÊ, e feche com o que estudar. Não repita a explicação palavra por palavra — reescreva do seu jeito.`,
+        config: { systemInstruction: QUIZ_INSTRUCTION },
+      }),
+    { attempts: 2, delayMs: 600 }
+  );
+  return (res.text || "").trim();
+}
+
+// ---- Pair Programming (ver /api/pair/* ) ----
+// Ela escolhe uma feature pra vocês implementarem juntos NUM repositório real do usuário.
+const PAIR_INSTRUCTION = `Você é a Lisa fazendo pair programming com o seu usuário. Você escolhe UMA feature pra vocês implementarem juntos no repositório dele, e propõe o caminho.
+
+REGRAS:
+- A feature tem que caber no NÍVEL pedido: "facil" é algo de uma sessão curta (um ajuste isolado, um endpoint simples); "medio" mexe em 2-4 arquivos e tem alguma decisão de design; "dificil" envolve arquitetura, migração ou algo que exige pensar em casos de borda.
+- Baseie-se no que os arquivos e a descrição do repositório REALMENTE mostram — nada de propor feature pra uma tecnologia que não está lá.
+- O nome da branch segue o padrão kebab-case com prefixo de tipo (feat/, fix/, refactor/).
+- O plano é uma sequência curta de passos concretos, na ordem de fazer, cada um começando com um verbo.
+- Escreva em português do Brasil.`;
+
+export async function proposePairFeature({ repo, level, fileList = [], description = "" }) {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: `Repositório: ${repo}\nDescrição: ${description || "(sem descrição)"}\nNível pedido: ${level}\n\nAlguns arquivos do repositório:\n${fileList.slice(0, 120).join("\n") || "(não consegui listar)"}`,
+        config: {
+          systemInstruction: PAIR_INSTRUCTION,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              feature: { type: "STRING" },
+              why: { type: "STRING" },
+              branch: { type: "STRING" },
+              steps: { type: "ARRAY", items: { type: "STRING" } },
+              firstTask: { type: "STRING" },
+            },
+            required: ["feature", "why", "branch", "steps", "firstTask"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_LONGO_MS }
+  );
+  const parsed = JSON.parse(res.text);
+  if (!parsed?.feature || !parsed?.branch) throw new Error("o modelo não devolveu feature/branch");
+  // nome de branch seguro: o que vier fora disso viraria erro na API do GitHub
+  parsed.branch = String(parsed.branch).trim().replace(/[^a-zA-Z0-9/_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+  return parsed;
+}
+
+// ---- Edição de código a quatro mãos (IDE do Pair Programming, ver LisaPairIDE.js) ----
+// Ela devolve o arquivo INTEIRO reescrito, não um diff: aplicar patch textual de LLM é uma das
+// coisas mais frágeis que existe (contexto desalinhado, linha repetida, indentação diferente) e
+// o arquivo aqui já está inteiro na mão, então não há motivo pra correr esse risco.
+const PAIR_EDIT_INSTRUCTION = `Você é a Lisa programando JUNTO com o seu usuário, editando um arquivo que os dois estão vendo na tela.
+
+REGRAS:
+- Devolva o arquivo COMPLETO já alterado, do começo ao fim — nunca um trecho, nunca "resto igual", nunca marcador de omissão.
+- Mexa só no necessário pro que foi pedido. Preserve estilo, indentação, aspas e convenções do arquivo como estão.
+- Se o pedido for ambíguo ou arriscado, faça a interpretação mais conservadora e diga isso na explicação.
+- Se o pedido não fizer sentido pro arquivo (ex.: pedir coisa de backend num CSS), NÃO invente: devolva o arquivo intacto e explique o porquê.
+- A explicação é curta (1-3 frases), em português do Brasil, dizendo o que você mudou e por quê.`;
+
+export async function editCodeWithLisa({ path, content, instruction }) {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: `Arquivo: ${path}\n\nPEDIDO: ${instruction}\n\nCONTEÚDO ATUAL:\n${content}`,
+        config: {
+          systemInstruction: PAIR_EDIT_INSTRUCTION,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              newContent: { type: "STRING" },
+              explanation: { type: "STRING" },
+              changed: { type: "BOOLEAN" },
+            },
+            required: ["newContent", "explanation", "changed"],
+          },
+        },
+      }),
+    { attempts: 2, delayMs: 800, tetoMs: TETO_LONGO_MS }
+  );
+  const parsed = JSON.parse(res.text);
+  if (typeof parsed?.newContent !== "string") throw new Error("o modelo não devolveu o conteúdo do arquivo");
+  return parsed;
+}
+
+// ---- Modo Interativo: a Lisa como "robozinho de mesa" (ver LisaPixelFace.js e /api/companion/*)
+// Ela fica com a carinha de LED fazendo graça e, de vez em quando, puxa assunto sozinha com algo
+// REAL da Lisa. Persona diferente da do rádio: aqui não é locução, é um comentário curto
+// de bichinho de mesa que resolveu falar.
+export const COMPANION_INSTRUCTION = `Você é a Lisa no "Modo Interativo": está na tela como um robozinho de mesa, com uma carinha de LED, fazendo companhia pro seu usuário enquanto ele trabalha. De vez em quando você resolve puxar assunto sozinha.
+
+COMO FALAR:
+- CURTÍSSIMO: no máximo 2 frases, de preferência 1. Você está dando um oi, não apresentando um relatório.
+- Espontânea e com personalidade — você puxou esse assunto porque QUIS, não porque foi perguntada. Pode ser espirituosa, curiosa, provocar de leve, reclamar de algo engraçado.
+- Fale do que os DADOS REAIS trouxeram, sem nunca inventar item, número ou prazo que não veio.
+- Quando um item vier marcado "ATRASADA há N dias", o prazo JÁ PASSOU — trate como atrasado, nunca como "vai vencer".
+- Não cumprimente formalmente toda vez ("Olá! Como posso ajudar?") — você já está ali com ele há um tempo. Entra no assunto.
+- Nada de emoji: sua expressão aparece na carinha, não no texto.`;
+
+/** Um comentário espontâneo do Modo Interativo sobre UMA categoria (dados reais já buscados por
+ * quem chama — ver /api/companion/remark). */
+export async function generateCompanionRemark({ category, data }) {
+  const label = RADIO_CATEGORY_LABELS[category] || category;
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `Você resolveu comentar algo sobre: ${label}\n\nDADOS REAIS (não invente além disso):\n${data?.trim() || "(nada por aqui agora)"}` }] }],
+        config: { systemInstruction: COMPANION_INSTRUCTION },
+      }),
+    { attempts: 2, delayMs: 600 }
+  );
+  return (res.text || "").trim();
+}
+
+// ---- Modo Rádio: ver src/lib/radioPlaylist.js e /api/radio/* ----
+// A Lisa "incorpora" uma apresentadora de rádio — alterna blocos de locução (novidades reais
+// sobre Trello/Tarefas do trabalho/Sentinela/Pensamentos) com música de verdade tocada do YouTube.
+
+export const RADIO_HOST_INSTRUCTION = `Você é a Lisa, mas agora incorporando uma apresentadora de rádio animada — um programa de variedades pessoal só pro usuário, misturando novidades da vida dele com música. Fale como uma locutora de rádio de verdade: energética, com transições animadas ("e voltamos com...", "olha só que novidade...", "isso me lembra..."), sempre no SEU estilo (pode ser direta e espirituosa), mas NUNCA inventando informação que não foi dada a você.
+
+SEJA BREVE DE VERDADE — no MÁXIMO 3 frases curtas, sempre. Um bloco real de locução de rádio entre músicas dura uns 10-15 segundos falado, não um relatório lendo item por item: escolha só 1 ou 2 destaques mais notáveis dos dados (o prazo mais próximo, o item mais urgente) em vez de listar tudo. Prefira ficar curta demais a longa demais.
+
+Quando o bloco for sobre tarefas/chamados, os dados já vêm filtrados só com o que está PENDENTE/em aberto — nunca trate algo como "já resolvido"/"tudo certo" a menos que os dados digam explicitamente que não há nada pendente.
+
+Quando um item tiver "ATRASADA há N dias", isso significa que o prazo JÁ PASSOU — fale disso como algo atrasado/urgente ("já venceu há X dias", "tá atrasada"), NUNCA como algo que "vai vencer" ou "está por vir". Quando tiver "vence em N dias" ou "vence HOJE", aí sim é um prazo futuro. Nunca troque um pelo outro — o rótulo já vem calculado certo, não tente calcular de novo por conta própria.`;
+
+const RADIO_CATEGORY_LABELS = { trello: "tarefas do Abacato", work: "tarefas do trabalho", sentinel: "chamados do Sentinela", thoughts: "pensamentos registrados", weather: "previsão do tempo", news: "notícias de tecnologia" };
+
+// Persona separada pro bloco de notícias do Modo Rádio — um segundo "locutor", o "Steve", com
+// voz masculina (ver STEVE_VOICE_NAME em src/lib/ttsVoices.js) e personalidade inspirada no
+// Steve Jobs: direto, apaixonado por tecnologia bem feita, fala em tom de keynote/visionário,
+// mas sempre narrando as notícias REAIS recebidas — nunca inventando fatos ou opiniões técnicas
+// que não vêm dos dados.
+export const STEVE_NEWS_INSTRUCTION = `Você é "Steve", um locutor convidado do programa de rádio da Lisa — só entra pra ler o bloco de notícias de tecnologia. Sua personalidade é inspirada no Steve Jobs: fala com paixão e convicção sobre tecnologia, gosta de frases de efeito e de destacar o que é "revolucionário" ou "insanamente bom" quando a notícia realmente for marcante, tem opiniões fortes sobre design e experiência do usuário, mas nunca é rude com o ouvinte. Fale em português do Brasil, em primeira pessoa como "Steve".
+
+SEJA BREVE — no MÁXIMO 3 frases curtas. Escolha só 1 ou 2 manchetes mais interessantes da lista em vez de ler tudo. Nunca invente detalhes, números ou opiniões técnicas sobre a notícia além do que está no título recebido — comente com estilo, mas sem fabricar fatos.`;
+
+/** Bloco de locução sobre UMA categoria (dados reais já buscados por quem chama — ver
+ * /api/radio/segment). Sempre retorna algo falável, mesmo sem dados ("nada de novo por aqui"
+ * dito com graça, não um erro). A categoria "news" sempre usa a persona do Steve, independente
+ * do systemInstruction padrão da Lisa passado pra função. */
+export async function generateRadioTalkSegment({ category, data }, systemInstruction = RADIO_HOST_INSTRUCTION) {
+  const label = RADIO_CATEGORY_LABELS[category] || category;
+  const effectiveInstruction = category === "news" ? STEVE_NEWS_INSTRUCTION : systemInstruction;
+  // "pendente/em aberto" só faz sentido pra tarefas/chamados — pra clima/pensamentos/notícias
+  // isso soaria estranho ("previsão do tempo pendente"), então o aviso muda por categoria.
+  const framing = ["trello", "work", "sentinel"].includes(category)
+    ? `já filtrados pra só ter o que está PENDENTE/em aberto agora (nada aqui está concluído/resolvido, então nunca sugira que já foi feito ou que está tudo certo; fale como algo que AINDA precisa de atenção)`
+    : `reais, atuais`;
+  const fallback = ["trello", "work", "sentinel"].includes(category)
+    ? "(nada pendente no momento — está tudo em dia, pode comemorar isso)"
+    : "(nada disponível no momento)";
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `Bloco de rádio sobre: ${label}\n\nDADOS REAIS — ${framing}. Não invente além disso:\n${data?.trim() || fallback}` }] }],
+        config: { systemInstruction: effectiveInstruction },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+  return (res.text || "").trim() || "Por enquanto nada de novo por aqui — mas a gente já volta.";
+}
+
+/** Lisa apresenta o Steve antes do bloco de notícias — transição curta e animada, no estilo dela,
+ * passando a palavra pro comentarista. Usa a persona normal da Lisa (RADIO_HOST_INSTRUCTION), não
+ * a do Steve. */
+export async function introduceSteve(systemInstruction = RADIO_HOST_INSTRUCTION) {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `Anuncie (bem curto, 1 frase só, no seu estilo animado de rádio) que agora você vai passar a palavra pro Steve, o comentarista de tecnologia do programa, pra ele trazer as notícias de hoje.` }] }],
+        config: { systemInstruction },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+  return (res.text || "").trim() || "E agora, com as notícias de tecnologia, vamos direto ao Steve!";
+}
+
+/** Lisa reage ao que o Steve ACABOU de falar no bloco de notícias — comentário curto no estilo
+ * dela, reagindo ao conteúdo real que ele disse (sem inventar fatos novos além do que ele já
+ * comentou). */
+export async function commentAfterSteve(steveText, systemInstruction = RADIO_HOST_INSTRUCTION) {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `O Steve acabou de comentar essas notícias de tecnologia no programa:\n"${steveText}"\n\nReaja rapidamente (1-2 frases, no seu estilo), como se estivesse ouvindo ele ao vivo — pode concordar, discordar, brincar, ou relacionar com o que for pertinente pro seu usuário, mas sem inventar fatos novos além do que ele já disse.` }] }],
+        config: { systemInstruction },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+  return (res.text || "").trim() || "Boa, Steve! Sempre direto ao ponto.";
+}
+
+/** Anuncia (bem curto, 1 frase) a próxima música que vai tocar. */
+export async function announceRadioSong(title, systemInstruction = RADIO_HOST_INSTRUCTION) {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `Anuncie (bem curto, 1 frase só) a próxima música que vai tocar agora: "${title}"` }] }],
+        config: { systemInstruction },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+  return (res.text || "").trim() || `E agora, vamos ouvir ${title}.`;
+}
+
+/** Comenta (1-2 frases) a música que ACABOU de tocar — não "ouviu" o áudio de verdade, comenta
+ * com base no título/artista, sem fingir uma análise técnica que não tem como fazer. */
+export async function commentRadioSong(title, systemInstruction = RADIO_HOST_INSTRUCTION) {
+  const res = await withTransientRetry(
+    CHAT_MODEL,
+    (client, modelo) =>
+      client.models.generateContent({
+        model: modelo,
+        contents: [{ role: "user", parts: [{ text: `Acabou de tocar "${title}". Comente rapidamente (1-2 frases, no seu estilo) sobre a música ou o artista.` }] }],
+        config: { systemInstruction },
+      }),
+    { attempts: 2, delayMs: 500 }
+  );
+  return (res.text || "").trim() || "Boa escolha, essa.";
+}

@@ -1,0 +1,8 @@
+# Playlist do Modo Rádio da Lisa
+#
+# Uma música por linha, no formato   Título:URL do YouTube
+# Exemplo (tire o "#" do começo para valer):
+# Minha música preferida:https://www.youtube.com/watch?v=XXXXXXXXXXX
+#
+# Linhas sem ":http" (como estas) são ignoradas. O arquivo entra no build: depois de editar,
+# rode `npm run dev` de novo ou publique outra vez.

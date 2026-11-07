@@ -1,0 +1,100 @@
+{
+  "name": "lisa-code",
+  "displayName": "Lisa Code",
+  "description": "A Lisa dentro do VS Code — conversa, lê e propõe mudanças no seu código. Fala com a sua própria instalação da Lisa.",
+  "version": "0.5.2",
+  "publisher": "personal-use-only",
+  "private": true,
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "lisaCode", "title": "Lisa Code", "icon": "resources/icon.svg" }
+      ]
+    },
+    "views": {
+      "lisaCode": [
+        { "id": "lisaCode.chatView", "name": "Lisa Code", "type": "webview" }
+      ]
+    },
+    "commands": [
+      { "command": "lisaCode.setToken", "title": "Lisa Code: Configurar token pessoal" },
+      { "command": "lisaCode.setBaseUrl", "title": "Lisa Code: Configurar URL da Lisa" },
+      { "command": "lisaCode.newConversation", "title": "Lisa Code: Nova conversa" },
+      { "command": "lisaCode.openFloating", "title": "Lisa Code: Abrir janela flutuante" },
+      { "command": "lisaCode.applyLook", "title": "Lisa Code: Aplicar visual da Lisa (tema + fonte)" },
+      { "command": "lisaCode.restoreLook", "title": "Lisa Code: Restaurar visual anterior" }
+    ],
+    "configuration": {
+      "title": "Lisa Code",
+      "properties": {
+        "lisaCode.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "URL base da Lisa (ex.: https://seu-deploy.vercel.app) — sem barra no final."
+        },
+        "lisaCode.gitWriteEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Permite que a Lisa crie branch, commite e dê push (cada operação ainda pede sua confirmação). Desligue pra tirar essas ferramentas de circulação sem desinstalar a extensão."
+        },
+        "lisaCode.modelo": {
+          "type": "string",
+          "enum": ["gemini", "groq"],
+          "enumDescriptions": [
+            "Gemini — o padrão, com o pool de 35 chaves em rodízio.",
+            "Groq — muito mais rápido, camada gratuita própria. Exige GROQ_API_KEY no servidor da Lisa."
+          ],
+          "default": "gemini",
+          "description": "Qual modelo responde na Lisa Code. A troca vale já na próxima mensagem, mesmo no meio de uma conversa — o histórico é guardado num formato só e traduzido a cada turno."
+        },
+        "lisaCode.terminalEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Permite que a Lisa rode comandos no terminal e leia a saída. Nasce DESLIGADO de propósito: é a única ferramenta dela que pode fazer algo sem volta. Comandos de rotina (ver comandosPermitidos) rodam direto; o resto pede sua confirmação, mostrando o comando exato."
+        },
+        "lisaCode.terminalSempreConfirma": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pedir confirmação em TODO comando, inclusive os da lista de permitidos. Mais seguro e mais cansativo — e o cansaço faz a gente clicar sem ler, que é o pior dos mundos."
+        },
+        "lisaCode.comandosPermitidos": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["ls", "dir", "pwd", "cat", "type", "head", "tail", "wc", "find", "grep", "rg", "which", "where", "git status", "git log", "git diff", "git branch", "git show", "git remote", "git stash list", "npm run", "npm test", "npm ci", "npm install", "npm list", "npx tsc", "node", "python", "python3", "pnpm", "yarn", "tsc", "jest", "vitest", "eslint", "prettier"],
+          "description": "Comandos que rodam sem perguntar. A comparação é por prefixo de palavra inteira, e nada com ; && | > $ passa direto, mesmo começando com um item desta lista."
+        }
+      }
+    },
+    "themes": [
+      { "label": "Lisa HUD — Ciano", "uiTheme": "vs-dark", "path": "./themes/lisa-hud-ciano.json" },
+      { "label": "Lisa HUD — Azul", "uiTheme": "vs-dark", "path": "./themes/lisa-hud-azul.json" },
+      { "label": "Lisa HUD — Roxo", "uiTheme": "vs-dark", "path": "./themes/lisa-hud-roxo.json" },
+      { "label": "Lisa HUD — Rosa", "uiTheme": "vs-dark", "path": "./themes/lisa-hud-rosa.json" },
+      { "label": "Lisa HUD — Vermelho", "uiTheme": "vs-dark", "path": "./themes/lisa-hud-vermelho.json" },
+      { "label": "Lisa HUD — Dourado", "uiTheme": "vs-dark", "path": "./themes/lisa-hud-dourado.json" },
+      { "label": "Lisa Imersivo — Ciano", "uiTheme": "vs-dark", "path": "./themes/lisa-imersivo-ciano.json" },
+      { "label": "Lisa Imersivo — Azul", "uiTheme": "vs-dark", "path": "./themes/lisa-imersivo-azul.json" },
+      { "label": "Lisa Imersivo — Roxo", "uiTheme": "vs-dark", "path": "./themes/lisa-imersivo-roxo.json" },
+      { "label": "Lisa Imersivo — Rosa", "uiTheme": "vs-dark", "path": "./themes/lisa-imersivo-rosa.json" },
+      { "label": "Lisa Imersivo — Vermelho", "uiTheme": "vs-dark", "path": "./themes/lisa-imersivo-vermelho.json" },
+      { "label": "Lisa Imersivo — Dourado", "uiTheme": "vs-dark", "path": "./themes/lisa-imersivo-dourado.json" }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "generate-themes": "node scripts/generate-themes.mjs",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0",
+    "@vscode/vsce": "^2.24.0"
+  }
+}

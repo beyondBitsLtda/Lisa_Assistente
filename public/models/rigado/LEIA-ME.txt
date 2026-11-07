@@ -1,0 +1,20 @@
+AVATAR "RIGADO" DA LISA — o seu modelo 3D com esqueleto (opcional)
+
+A aparência "Rigado" do avatar 3D (ajustes do Assistente) carrega um modelo seu, com esqueleto e
+animações do Mixamo (https://www.mixamo.com). O repositório NÃO traz nenhum modelo aqui: use um
+modelo que você tenha o direito de usar (criado por você, ou com licença que permita).
+
+Arquivos esperados nesta pasta:
+
+  base.fbx       OBRIGATÓRIO — animação "Idle", exportada "With Skin" (malha + esqueleto + clipe)
+  talking.fbx    opcional — animação de fala (ex.: "Talking"), exportada "Without Skin"
+  listening.fbx  opcional — animação de escuta (ex.: "Head Turn" / "Look Around"), "Without Skin"
+
+Passo a passo:
+  1. Suba o seu modelo (.fbx ou .obj) no Mixamo e deixe ele colocar o esqueleto (auto-rig).
+  2. Escolha a animação "Idle" e baixe em FBX, "With Skin" → salve aqui como base.fbx.
+  3. (Opcional) Baixe uma animação de fala e uma de escuta, "Without Skin" → talking.fbx e listening.fbx.
+
+Sem os opcionais, o avatar funciona só com a animação Idle em todo modo — nada quebra, é só menos
+expressivo. Sem o base.fbx, a tela avisa que não achou o modelo e o resto da Lisa segue normal.
+O código que carrega os arquivos está em src/components/panels/LisaAvatarRigado.js.

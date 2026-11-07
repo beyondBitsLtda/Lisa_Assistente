@@ -1,0 +1,5850 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import dynamic from "next/dynamic";
+import { cleanForSpeech, pedacosParaVoz } from "@/lib/cleanForSpeech.js";
+import { criarFalaAoVivo } from "@/lib/falaAoVivo.js";
+import { detectarAcordar, interpretarComando, escolherMusica, normalizar } from "@/lib/escutaPorPalavra.js";
+import { useLog } from "@/components/shell/LogProvider.js";
+import { CY, OR, GR, PU, mono, meterFor, dotColor } from "@/lib/theme.js";
+import { langForPath } from "@/lib/highlightCode.js";
+import { respostaSemCodigo, trechosDaResposta, codigoDaConversa } from "@/lib/codigoNaResposta.js";
+import { pedidoDeDesenho, descreverDiagrama, resumoDaMudanca, pedeMudancaNoDesenho } from "@/lib/diagramaDaLisa.js";
+import usePapel from "@/lib/usePapel.js";
+import { ContaNoCelular } from "@/components/shell/MenuDaConta.js";
+import { podeAcessar } from "@/lib/authSession.js";
+import { PEDIDO_DE_CONSENTIMENTO, pedidoDaSegundaEtapa, perguntasDaEtapa, perfilDaEtapa, etapaQueFalta, respostaAoConvite, PEDE_APAGAR_PERFIL } from "@/lib/modoUsuario.js";
+import TextoComCodigo from "@/components/panels/TextoComCodigo.js";
+import FontesDaWeb from "@/components/panels/FontesDaWeb.js";
+import CenaDaLisa from "@/components/panels/hud/CenaDaLisa.js";
+import JanelaDaResposta from "@/components/panels/hud/JanelaDaResposta.js";
+import { citaProjeto, projetoDoPedido, perguntaDoProjeto, fluxoCitado, contextoDoProjeto, pedeEmTodos, pedeDocumentacao, respostaComDocumentos, ajustarAoPedido, documentosPorDesenho, respostaDeConfirmacao, textoDaConfirmacao, VALIDADE_DA_CONFIRMACAO_MS, pedeNovoDesenho, planoDeDesenhoNovo } from "@/lib/processmapNaConversa.js";
+import { pedirPlano, executarPlano, textoDoAndamento, escreverDocumentos } from "@/lib/trabalhoNoProjeto.js";
+import { apiDosFluxos } from "@/lib/fluxogramasNoNavegador.js";
+
+const apiDosFluxosDaConversa = apiDosFluxos();
+import { Highlight } from "prism-react-renderer";
+import { TTS_VOICES, STEVE_VOICE_NAME } from "@/lib/ttsVoices.js";
+import { pickBrowserVoice, speakText, stopBrowserVoiceAudio, isBrowserVoiceAudioPlaying } from "@/lib/browserVoice.js";
+import { useIsMobile } from "@/lib/useIsMobile.js";
+import TopoExtra from "@/components/shell/TopoExtra.js";
+import Suspenso, { GrupoDoMenu, ItemDoMenu, ChaveDoMenu, SegmentosDoMenu, LinkDoMenu } from "@/components/shell/Suspenso.js";
+import RotuloDaVoz from "@/components/panels/RotuloDaVoz.js";
+import { adicionarTurno, conversaVigente, falaQueValePergunta, interrupcaoNaFala, marcarInterrompida } from "@/lib/conversa.js";
+import { pareceAcao, falaSemRascunho, separarRascunho } from "@/lib/acoesNoAbacato.js";
+import { acordarAudio, escutarElemento, nivelDaVoz, abrirMicrofone, fecharMicrofone, nivelDoMicrofone } from "@/lib/vozAnalisador.js";
+import { ACCENT_THEMES, DEFAULT_ACCENT, applyAccentTheme } from "@/lib/accentThemes.js";
+import { getDeviceId, matchNavCommand } from "@/lib/deviceId.js";
+import { runFullSync } from "@/lib/sync.js";
+import { hostScreenShare, viewerWatchScreen } from "@/lib/screenShareRTC.js";
+import { loadYouTubeAPI, createYouTubePlayer, playAndWaitEnded } from "@/lib/youtubePlayer.js";
+import LisaPixelFace from "@/components/panels/LisaPixelFace.js";
+import LisaTicTacToe from "@/components/panels/LisaTicTacToe.js";
+import LisaPong from "@/components/panels/LisaPong.js";
+import LisaPenalty from "@/components/panels/LisaPenalty.js";
+import LisaConnect4 from "@/components/panels/LisaConnect4.js";
+import LisaMemory from "@/components/panels/LisaMemory.js";
+import LisaReflex from "@/components/panels/LisaReflex.js";
+import LisaBattleship from "@/components/panels/LisaBattleship.js";
+import LisaAirHockey from "@/components/panels/LisaAirHockey.js";
+import LisaRockPaper from "@/components/panels/LisaRockPaper.js";
+import LisaDisc from "@/components/panels/LisaDisc.js";
+import LisaQuiz from "@/components/panels/LisaQuiz.js";
+// LisaPairProgramming NÃO entra aqui de propósito: ele arrasta o Monaco junto, e o Pair
+// Programming agora vive na janela /pair. Importar aqui engordaria o pacote do Assistente à toa.
+import { loadGames } from "@/lib/gameHistory.js";
+
+// carregado sob demanda (three.js + o modelo glTF pesam ~12MB) — só baixa se a pessoa
+// realmente ligar a Visão 3D; desktop-only por decisão do usuário, nunca entra no bundle mobile.
+// a voz da Lisa como esfera de pontos (three.js) — aparência padrão desde a revisão visual
+// o visual do centro (Esfera de pontos, Lente, Orbe, Plasma, Anel) — escolhido no painel /visual
+import VisualDaLisa, { usarVisualEscolhido, usarAjustesDoRosto } from "@/components/panels/visuais/VisualDaLisa.js";
+import { VISUAIS, escolherVisual, visuaisDoUsuario, visualDoUsuario } from "@/lib/visuaisDaLisa.js";
+import { CABELOS_DO_ROSTO, PALETAS_DO_ROSTO, escolherAjustesDoRosto } from "@/lib/rostoDaLisa.js";
+// o contexto da conversa (25/10/2026): imagens anexadas (o +, Ctrl+V, arrastar) e repositórios vinculados
+import { BotaoMais, FaixaDoContexto } from "@/components/panels/ContextoDaConversa.js";
+// o microfone do celular como o do WhatsApp (02/11/2026): segura grava, solta envia, ← cancela, ↑ trava
+import MicrofoneDaLisa from "@/components/panels/MicrofoneDaLisa.js";
+// a Conversa livre no celular escuta gravando, e o nome dela sai certo na fala (03/11/2026, BEYOND-0011)
+import { abrirConversaPorGravacao } from "@/lib/conversaPorGravacao.js";
+import { corrigirNomeDaLisa, dicaDoErro } from "@/lib/falaComoWhatsApp.js";
+import { imagemParaAnexo, imagensDaColagem, imagensSoltas } from "@/lib/anexosDaConversa.js";
+import { MAX_ANEXOS } from "@/lib/contextoDaConversa.js";
+import { reposNoTexto, vinculosValidos } from "@/lib/enderecoDoRepositorio.js";
+// Modo Tomar nota (27/10/2026): escuta até 10 min e anota por assunto no quadro "Notas" do Abacato
+import TomarNota from "@/components/panels/TomarNota.js";
+import { pedidoDeTomarNota } from "@/lib/tomarNota.js";
+// "Instalar app" do Chrome (27/10/2026): ver src/lib/instalarApp.js
+import usarInstalacao from "@/components/shell/usarInstalacao.js";
+import { DICA_DO_IPHONE } from "@/lib/instalarApp.js";
+import { QUADRO_PRINCIPAL } from "@/lib/quadroPrincipal.js";
+// o editor que abre quando a resposta traz código (qualquer modo — ver IdeDaLisa.js)
+const IdeDaLisa = dynamic(() => import("@/components/panels/IdeDaLisa.js"), { ssr: false, loading: () => null });
+const QuadroDaLisa = dynamic(() => import("@/components/panels/QuadroDaLisa.js"), { ssr: false, loading: () => null });
+const LisaAvatar3D = dynamic(() => import("@/components/panels/LisaAvatar3D.js"), {
+  ssr: false,
+  loading: () => null,
+});
+// segunda "aparência" 3D — um modelo rigado seu (esqueleto de verdade via Mixamo), ver
+// src/components/panels/LisaAvatarRigado.js. Mesmo contrato de props (mode), mesmo lazy-load.
+const LisaAvatarRigado = dynamic(() => import("@/components/panels/LisaAvatarRigado.js"), {
+  ssr: false,
+  loading: () => null,
+});
+
+/** "Destrava" o autoplay de áudio da página — chame SEMPRE dentro do próprio onClick síncrono
+ * de um botão (nunca depois de um await). Navegadores só liberam o 1º play() de verdade se ele
+ * estiver bem colado num gesto do usuário; o Modo Rádio só fala depois de buscar o texto no
+ * Gemini (alguns segundos, várias idas à rede) — tempo demais pro navegador ainda contar como
+ * "gesto do usuário", então o 1º bloco tocava mudo. Um áudio silencioso tocado AQUI, na hora do
+ * clique, satisfaz a política do navegador pro resto da sessão (os áudios de verdade, mesmo
+ * vindos de código assíncrono bem depois, tocam normalmente depois disso). */
+function unlockAudioPlayback() {
+  try {
+    new Audio("data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=").play().catch(() => {});
+  } catch {
+    // sem suporte a Audio (não deveria acontecer em nenhum navegador real) — só segue sem destravar
+  }
+}
+
+/** Uma fala dela nunca prende a Conversa livre por mais que isto (BEYOND-0011). */
+const FALA_MAXIMA_MS = 4 * 60_000;
+
+/** Espera a fala dela acabar — a fila inteira (pedaços que entram depois também) e o áudio tocando —,
+ *  até `parou()` ou o teto. Sem teto, um áudio que nunca avisava que terminou deixava a Conversa livre
+ *  em "respondendo…" para sempre (BEYOND-0011). */
+async function esperarAFalaAcabar({ fila, falando, parou, ateMs = Date.now() + FALA_MAXIMA_MS }) {
+  const esperar = (ms) => new Promise((ok) => setTimeout(ok, ms));
+  let atual;
+  do {
+    atual = fila();
+    await Promise.race([Promise.resolve(atual).catch(() => {}), esperar(Math.max(0, ateMs - Date.now()))]);
+  } while (atual !== fila() && !parou() && Date.now() < ateMs);
+  while (!parou() && falando() && Date.now() < ateMs) await esperar(250);
+}
+
+const MODE_META = {
+  idle: { label: "IDLE", sub: "awaiting command", color: CY },
+  listening: { label: "LISTENING", sub: "retrieving context", color: GR },
+  speaking: { label: "SPEAKING", sub: "streaming response", color: OR },
+  // janela de resposta automática do Modo Escuta (ver openReplyWindow) — mesmo rótulo
+  // "LISTENING" do mic manual, mas o texto de baixo diz exatamente o que está diferente aqui.
+  autolisten: { label: "LISTENING", sub: "pode falar agora", color: GR },
+};
+
+const TASKS_SCOPE = "__tasks__";
+const THOUGHTS_SCOPE = "__thoughts__";
+const SENTINEL_SCOPE = "__sentinel__";
+const WORK_SCOPE = "__work__";
+const CODE_SCOPE = "__code__";
+
+// ---- Modo Escuta: grava um AudioBuffer decodificado (Web Audio API) como WAV PCM16 mono —
+// formato simples e garantido aceito pelo Gemini via inlineData (testado direto contra a API
+// antes de usar aqui; o WAV que o MediaRecorder produz sozinho varia de formato por navegador
+// e nem sempre é um tipo que o Gemini reconhece). Funções puras, fora do componente — não
+// dependem de nada do React.
+function encodeWavPCM16(audioBuffer) {
+  const numFrames = audioBuffer.length;
+  const sampleRate = audioBuffer.sampleRate;
+  // mixa todos os canais pra mono — mais simples, menor, e voz/canto não perde nada relevante nisso
+  const channels = [];
+  for (let c = 0; c < audioBuffer.numberOfChannels; c++) channels.push(audioBuffer.getChannelData(c));
+  const mono = new Float32Array(numFrames);
+  for (let i = 0; i < numFrames; i++) {
+    let sum = 0;
+    for (let c = 0; c < channels.length; c++) sum += channels[c][i];
+    mono[i] = sum / channels.length;
+  }
+  const dataSize = numFrames * 2; // 16 bits = 2 bytes por amostra
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits por amostra
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+  let offset = 44;
+  for (let i = 0; i < numFrames; i++) {
+    const s = Math.max(-1, Math.min(1, mono[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return buffer;
+}
+
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const CHUNK = 0x8000; // evita "too many arguments" do apply em buffers grandes
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+// bipe curto (sintetizado na hora, sem arquivo de áudio nenhum) — sinal SONORO de "pode falar
+// agora", pra além do indicador visual, já que o usuário pode não estar olhando pra tela na
+// hora (é bem o ponto de deixar o microfone aberto sozinho).
+function playListenBeep() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.2);
+    osc.onended = () => ctx.close();
+  } catch {}
+}
+
+export default function AssistantPage() {
+  const { logs, addLog } = useLog();
+  const [mode, setMode] = useState("idle");
+  // (01/11/2026, o MVP) o papel de quem está na tela. O USUÁRIO tem a conversa, a voz, o Modo Tela, o
+  // editor de código, o ProcessMap, os repositórios públicos, a entrevista e a Lisa Task (o Abacato); os modos do
+  // admin somem da tela e ficam desligados (quem barra de verdade é o portão, src/middleware.js)
+  const papel = usePapel();
+  const usuario = papel === "usuario";
+  const usuarioRef = useRef(false);
+  usuarioRef.current = usuario;
+  const entrevistaRef = useRef({ estado: null, etapa: 1, i: 0, respostas: {}, nome: "" });
+  const entrevistaFazRef = useRef(null);
+  const [cards, setCards] = useState([]);
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  // os sites que a Lisa usou quando pesquisou na internet (evento "fontes" do /api/ask)
+  const [fontes, setFontes] = useState([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  // a janela da resposta (01/11/2026, src/components/panels/hud/): o × fecha até a próxima pergunta,
+  // e cada pergunta nova faz a janela surgir de novo (a chave dela muda)
+  const [janelaFechada, setJanelaFechada] = useState(false);
+  const [numeroDaResposta, setNumeroDaResposta] = useState(0);
+  useEffect(() => {
+    if (!busy) return;
+    setJanelaFechada(false);
+    setNumeroDaResposta((n) => n + 1);
+  }, [busy]);
+  const [listening, setListening] = useState(false);   // mic ativo (STT)
+  // true só durante a janela de resposta automática do Modo Escuta (listenForReply) — sinal
+  // visual/sonoro claro de "agora é sua vez de falar", separado do `listening` do botão manual.
+  const [autoListening, setAutoListening] = useState(false);
+  const [voiceOn, setVoiceOn] = useState(true);         // ler respostas em voz alta (TTS)
+  const [voiceSupported, setVoiceSupported] = useState(true);
+  const [geminiVoiceEnabled, setGeminiVoiceEnabled] = useState(true); // tentar a voz do Gemini? (desligado = só navegador)
+  const [geminiVoiceStatus, setGeminiVoiceStatus] = useState(null);   // null=não testada ainda · true=ok · false=falhou (última tentativa real)
+  // "disjuntor": sem isso, CADA resposta nova testava o Gemini do zero — se ele estivesse
+  // instável, uma resposta saía na voz dele e a próxima já caía pro navegador, sem padrão
+  // nenhum (é o que dava a sensação de "ficar trocando"). Uma vez que falha de verdade,
+  // para de tentar por um tempo (fica só na voz do navegador, de forma CONSISTENTE) em vez
+  // de tentar de novo já na pergunta seguinte.
+  const GEMINI_COOLDOWN_MS = 60000;
+  const geminiDownUntilRef = useRef(0);
+  // voz do Gemini escolhida — guardada no navegador (não temos como ouvir as 30 vozes daqui
+  // pra saber quais soam femininas; teste e escolha a que preferir).
+  const [voiceName, setVoiceName] = useState("Kore");
+  const [mobileTab, setMobileTab] = useState("visualizer"); // só usado no mobile (ver globals.css): "logs" | "visualizer" | "context"
+
+  // escopo do assistente: "painel" (board/tarefas/pensamentos específico) ou "geral" (tudo + web)
+  const [scopeMode, setScopeMode] = useState("panel");
+  const [scopePanel, setScopePanel] = useState(QUADRO_PRINCIPAL);
+  const [panelOptions, setPanelOptions] = useState([QUADRO_PRINCIPAL]);
+
+  // projeto do Sentinela selecionado manualmente (só usado quando o escopo é "Chamados (Sentinela)") —
+  // sem isso o assistente não sabe dizer de qual projeto de teste está falando, a menos que o
+  // nome do projeto apareça literalmente na pergunta.
+  const [sentinelProjectId, setSentinelProjectId] = useState("all");
+  const [sentinelProjects, setSentinelProjects] = useState([]);
+  // escopo "Código": qual repositório (like o seletor de projeto do Sentinela) e, dentro
+  // dele, qual arquivo específico (opcional — sem arquivo, é busca semântica; com arquivo,
+  // é leitura completa dele, ver resolveScope em scopeResolver.js).
+  const [codeRepo, setCodeRepo] = useState("all");
+  const [codeFile, setCodeFile] = useState("");
+  const [codeRepos, setCodeRepos] = useState([]);
+  const [codeFiles, setCodeFiles] = useState([]);
+
+  // Modo Persona: liga a personalidade descrita em persona.md (raiz do repo) por cima das
+  // respostas — desligado por padrão (tom direto/neutro de sempre).
+  const [personaMode, setPersonaMode] = useState(false);
+  // qual categoria de recursos está aberta na barra do desktop (null = todas fechadas) — ver
+  // a fileira de "chips" logo antes das abas CHAT/LOGS.
+  const [openSettingsCategory, setOpenSettingsCategory] = useState(null);
+
+  // Modo Código: com isso ligado (e um repositório+branch escolhidos), toda pergunta vira um
+  // PEDIDO DE MUDANÇA DE CÓDIGO em vez de uma conversa normal — ver askCodeMode/
+  // /api/code-tasks/stream. Narra cada fase (Lisa "comenta" o que está fazendo, com voz) e
+  // mostra o código de cada arquivo sendo escrito ao vivo (liveCode), não só o PR pronto no
+  // final. Nunca commita na branch escolhida — sempre cria uma branch nova e abre um PR.
+  const [codeMode, setCodeMode] = useState(false);
+  // o editor de código (IdeDaLisa): as respostas desta conversa que trouxeram código, uma aba
+  // cada — perguntar de novo não apaga nada. `ideViva` é a resposta chegando agora (o texto dela
+  // é o `answer`); quando termina, ela entra no histórico (se tiver código) com o mesmo id.
+  const [ideHistorico, setIdeHistorico] = useState([]);
+  const [ideViva, setIdeViva] = useState(null); // { id, pergunta, alvo }
+  // `alvo` (BEYOND-0009): a aba da IDE de onde saiu o pedido ("pedir à Lisa") — a resposta é
+  // escrita em cima dela quando termina
+  const abrirNaIde = useCallback((pergunta, alvo = null) => {
+    const id = `r${Date.now()}`;
+    setIdeViva({ id, pergunta, alvo });
+    return id;
+  }, []);
+  const guardarNaIde = useCallback((id, pergunta, texto, alvo = null) => {
+    setIdeViva((v) => (v?.id === id ? null : v));
+    if (trechosDaResposta(texto).temCodigo) setIdeHistorico((h) => [...h, { id, pergunta, texto, alvo }].slice(-30));
+  }, []);
+  // o que está escrito ou mudado na IDE (as abas suas e as que você editou): vai junto das perguntas
+  const codigoDaIdeRef = useRef("");
+  // o quadro da Lisa (BEYOND-0010): o processo desenhado na tela. `desenhoRef` é o documento como
+  // está agora no quadro (com o que a pessoa mexeu) — vai em texto junto das perguntas.
+  const [quadro, setQuadro] = useState(null); // { versao: { doc, chave, colecao }, titulo, explicacao }
+  const [desenhando, setDesenhando] = useState(false);
+  const desenhoRef = useRef(null);
+  const quadroAbertoRef = useRef(false);
+  quadroAbertoRef.current = Boolean(quadro);
+  const desenharNaTelaRef = useRef(null);
+  // os projetos do ProcessMap na conversa (01/11/2026): a lista (guardada 30 s), o fluxo salvo que está
+  // aberto no quadro (o quadro avisa) e quem acha o projeto citado — ver resolverProjetoRef abaixo
+  const projetosRef = useRef({ em: 0, lista: null });
+  const quadroVinculoRef = useRef(null); // { fluxo, projeto }
+  const resolverProjetoRef = useRef(null);
+  const ultimoProjetoRef = useRef(null); // o último projeto em que a Lisa trabalhou nesta conversa
+  const planejarNoProjetoRef = useRef(null);
+  const trabalharNoProjetoRef = useRef(null);
+  const documentarNoProjetoRef = useRef(null);
+  // o pedido sobre o projeto esperando o "sim" (01/11/2026: "ela deve me perguntar se eu tenho certeza;
+  // se eu disser sim, aí ela faz"): { q, doProjeto, plano, como, em }
+  const planoPendenteRef = useRef(null);
+  const confirmarNoProjetoRef = useRef(null);
+  const executarPendenteRef = useRef(null);
+  // o pedido de desenho que caiu na conversa comum e que a Lisa entendeu e perguntou "Posso fazer?" (o
+  // evento "desenho" do /api/ask; 02/11/2026: "pode fazer a alteração" → "é só me dar o comando direto"):
+  // { q, imagens, em } — o "sim" seguinte desenha (fazerDesenhoConfirmadoRef)
+  const desenhoPendenteRef = useRef(null);
+  const fazerDesenhoConfirmadoRef = useRef(null);
+  // as mensagens da conversa, para mandar o código que já apareceu nela junto da pergunta
+  const mensagensRef = useRef([]);
+
+  // Modo Vigia: com isso ligado, toda pergunta busca no HISTÓRICO de observações do Modo Tela
+  // (tabela screen_observations, ver src/lib/screenWatch.js) em vez de conversar normalmente
+  // — não depende da tela estar sendo compartilhada NESTE aparelho, funciona de qualquer
+  // dispositivo (inclusive celular), já que só lê uma tabela na nuvem. `vigiaAutoOn` narra
+  // sozinha de tempos em tempos o que há de novo (mesmo padrão da vigília do Modo Tela).
+  const [vigiaMode, setVigiaMode] = useState(false);
+  const [vigiaAutoOn, setVigiaAutoOn] = useState(false);
+  const [vigiaAutoIntervalMs, setVigiaAutoIntervalMs] = useState(60000);
+  const vigiaLastIdRef = useRef(0); // maior id já narrado — só o que vier DEPOIS disso conta
+  useEffect(() => { if (!vigiaMode) setVigiaAutoOn(false); }, [vigiaMode]);
+
+  // Assistir ao vivo (Transmissão, lado espectador): pede pra ver a tela de OUTRO dispositivo
+  // que esteja com Modo Tela + Transmissão ligados — ver src/lib/screenShareRTC.js. Não
+  // depende de screenMode neste aparelho (é o ponto inteiro: assistir de qualquer lugar).
+  const [vigiaWatching, setVigiaWatching] = useState(false);
+  const [vigiaWatchStatus, setVigiaWatchStatus] = useState(null); // null|"procurando"|"connecting"|"connected"|"failed"|"closed"|"disconnected"
+  const vigiaWatchVideoRef = useRef(null);
+  const screenShareViewerRef = useRef(null);
+  useEffect(() => { if (!vigiaMode) setVigiaWatching(false); }, [vigiaMode]);
+
+  // linha(s) de diagnóstico mais recentes, mostradas DIRETO embaixo do preview flutuante (ver
+  // watchPreviews) — sem precisar navegar até a aba LOGS separada pra ver o que está
+  // acontecendo, especialmente útil no celular.
+  const [watchDebugLines, setWatchDebugLines] = useState([]);
+  const pushWatchDebug = useCallback((line) => {
+    setWatchDebugLines((lines) => [...lines.slice(-5), line]);
+  }, []);
+
+  useEffect(() => {
+    if (!vigiaWatching) { setVigiaWatchStatus(null); return; }
+    screenShareViewerRef.current = viewerWatchScreen({
+      deviceId: getDeviceId(),
+      onTrack: (mediaStream) => {
+        addLog("[VIGIA]", GR, `stream recebida: ${mediaStream?.getVideoTracks().length ?? 0} faixa(s) de vídeo`);
+        pushWatchDebug(`tela: faixa de vídeo recebida`);
+        // ontrack dispara UMA VEZ POR FAIXA (vídeo, áudio…) mesmo sendo o mesmo stream — sem
+        // essa checagem, religar o srcObject de novo pra cada faixa cancelava o play() anterior
+        // ("interrupted by a new load request"), inofensivo mas gerava ruído no log.
+        if (vigiaWatchVideoRef.current && vigiaWatchVideoRef.current.srcObject !== mediaStream) {
+          vigiaWatchVideoRef.current.srcObject = mediaStream;
+          vigiaWatchVideoRef.current.play().catch((err) => { addLog("[VIGIA]", OR, `play() falhou: ${err.message}`); pushWatchDebug(`tela: play() falhou — ${err.message}`); });
+        }
+      },
+      onStatus: (s) => { setVigiaWatchStatus(s); pushWatchDebug(`tela: ${s}`); },
+      onLog: (msg) => { addLog("[VIGIA]", OR, msg); pushWatchDebug(`tela: ${msg}`); },
+    });
+    return () => { screenShareViewerRef.current?.stop(); screenShareViewerRef.current = null; };
+  }, [vigiaWatching, addLog, pushWatchDebug]);
+
+  // Assistir a Câmera de Vigia de outro dispositivo (canal "camera") — mesma mecânica de
+  // "Assistir ao vivo" acima, só que aponta pro canal da câmera em vez do da tela. `sendChat`
+  // manda uma mensagem de texto pro dispositivo que está com a câmera ligada — a Lisa lá lê em
+  // voz alta e mostra na tela dele, tipo um interfone.
+  const [cameraWatching, setCameraWatching] = useState(false);
+  const [cameraWatchStatus, setCameraWatchStatus] = useState(null);
+  const cameraWatchVideoRef = useRef(null);
+  const screenShareCameraViewerRef = useRef(null);
+  const [cameraChatText, setCameraChatText] = useState("");
+  useEffect(() => { if (!vigiaMode) setCameraWatching(false); }, [vigiaMode]);
+  useEffect(() => {
+    if (!cameraWatching) { setCameraWatchStatus(null); return; }
+    screenShareCameraViewerRef.current = viewerWatchScreen({
+      deviceId: getDeviceId(),
+      channel: "camera",
+      onTrack: (mediaStream) => {
+        addLog("[VIGIA]", GR, `câmera recebida: ${mediaStream?.getVideoTracks().length ?? 0} faixa(s) de vídeo`);
+        pushWatchDebug(`câmera: faixa de vídeo recebida`);
+        if (cameraWatchVideoRef.current && cameraWatchVideoRef.current.srcObject !== mediaStream) {
+          cameraWatchVideoRef.current.srcObject = mediaStream;
+          cameraWatchVideoRef.current.play().catch((err) => { addLog("[VIGIA]", OR, `play() falhou: ${err.message}`); pushWatchDebug(`câmera: play() falhou — ${err.message}`); });
+        }
+      },
+      onStatus: (s) => { setCameraWatchStatus(s); pushWatchDebug(`câmera: ${s}`); },
+      onLog: (msg) => { addLog("[VIGIA]", OR, msg); pushWatchDebug(`câmera: ${msg}`); },
+    });
+    return () => { screenShareCameraViewerRef.current?.stop(); screenShareCameraViewerRef.current = null; };
+  }, [cameraWatching, addLog, pushWatchDebug]);
+
+  const sendCameraChat = useCallback(() => {
+    const text = cameraChatText.trim();
+    if (!text) return;
+    const ok = screenShareCameraViewerRef.current?.sendChat(text);
+    if (ok) { addLog("[VIGIA]", GR, `mensagem enviada: ${text}`); setCameraChatText(""); }
+    else addLog("[VIGIA]", OR, "ainda não conectado a nenhum dispositivo com a Câmera de Vigia ligada");
+  }, [cameraChatText, addLog]);
+
+  // Tela cheia (custom, não a Fullscreen API nativa) pros vídeos ao vivo — a API nativa
+  // (video.requestFullscreen/webkitEnterFullscreen) se mostrou instável no navegador do
+  // celular do usuário (não abria e ainda recarregava a página). Isso aqui é só um overlay
+  // nosso reaproveitando o MESMO stream que já está tocando no preview pequeno.
+  const [fullscreenSource, setFullscreenSource] = useState(null); // {stream, label} | null
+  const openFullscreen = useCallback((videoEl, label) => {
+    if (videoEl?.srcObject) setFullscreenSource({ stream: videoEl.srcObject, label });
+  }, []);
+
+  const [codeModeRepo, setCodeModeRepo] = useState("");
+  const [codeModeBranch, setCodeModeBranch] = useState("");
+  const [codeModeRepos, setCodeModeRepos] = useState([]);
+  const [codeModeBranches, setCodeModeBranches] = useState([]);
+  // arquivos escolhidos à mão, garantidos no contexto de TODO pedido enquanto o Modo Código
+  // ficar ligado (sem isso, só a busca semântica decide — e ela erra fácil em pedidos amplos
+  // tipo "mude o tema", que não se parecem textualmente com os arquivos de config certos).
+  const [codeModeFiles, setCodeModeFiles] = useState([]);
+  const [codeModeAvailableFiles, setCodeModeAvailableFiles] = useState([]);
+  const CODE_MODE_MAX_FILES = 6; // precisa bater com MAX_FILES_PER_TASK em src/lib/codeTasks.js
+  const [liveCode, setLiveCode] = useState(null); // { path, content } — arquivo sendo escrito agora
+  const [liveCodeDone, setLiveCodeDone] = useState([]); // arquivos já concluídos nesta tarefa
+  const currentCodeFileRef = useRef(null);
+  // sessão de CONTINUAÇÃO — enquanto existir (mesmo repo+branch base), o próximo pedido de
+  // código não recomeça do zero: continua commitando na MESMA branch/PR já aberto, lendo o
+  // conteúdo AO VIVO do GitHub (não do índice, que pode estar desatualizado) pros arquivos
+  // já tocados. É o que permite "corrige esse erro" like conversa, sem abrir PR novo cada vez.
+  const [codeSession, setCodeSession] = useState(null); // { repo, baseBranch, branchName, prUrl, files }
+  const [codeModalInput, setCodeModalInput] = useState("");
+  // janela flutuante e arrastável do Modo Código, com cara de editor (título + abas por
+  // arquivo + área de código com número de linha) — abre sozinha quando uma tarefa começa,
+  // mostra em que ESTÁGIO a Lisa está (não só a última frase dita) e o código sendo escrito.
+  const [codeModalOpen, setCodeModalOpen] = useState(false);
+  const [codeModalPos, setCodeModalPos] = useState({ x: 60, y: 50 });
+  // grande de propósito, tipo editor de verdade (VS Code aberto) — não uma janelinha de
+  // chat. O usuário pode redimensionar/arrastar/minimizar à vontade depois de aberta.
+  const [codeModalSize, setCodeModalSize] = useState({ width: 1040, height: 720 });
+  const [codeModalMaximized, setCodeModalMaximized] = useState(false);
+  const [codeModalMinimized, setCodeModalMinimized] = useState(false);
+  const [codeActiveTab, setCodeActiveTab] = useState(null); // path da aba escolhida à mão; null = segue o arquivo sendo escrito agora
+  const [codeStage, setCodeStage] = useState(null); // 'context'|'writing'|'branching'|'committing'|'pr'|'done'|'error'
+  const CODE_STAGE_LABELS = {
+    context: "🔍 buscando contexto",
+    "context-select": "🧭 escolhendo os arquivos certos",
+    "context-fetch": "📖 lendo o conteúdo dos arquivos",
+    planning: "🧠 decidindo o que muda",
+    writing: "✍️ escrevendo o código",
+    fixing: "🔧 corrigindo um erro de sintaxe",
+    branching: "🌿 criando branch",
+    committing: "📝 aplicando arquivos",
+    pr: "🔀 abrindo pull request",
+    done: "✅ concluído",
+    error: "⚠ erro",
+  };
+  const onCodeModalDragStart = useCallback((e) => {
+    if (codeModalMaximized) return; // maximizada preenche a tela — arrastar não faz sentido
+    const startX = e.clientX, startY = e.clientY;
+    const origX = codeModalPos.x, origY = codeModalPos.y;
+    const onMove = (ev) => setCodeModalPos({ x: origX + (ev.clientX - startX), y: origY + (ev.clientY - startY) });
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }, [codeModalPos, codeModalMaximized]);
+  const onCodeModalResizeStart = useCallback((e) => {
+    e.stopPropagation();
+    if (codeModalMaximized) return;
+    const startX = e.clientX, startY = e.clientY;
+    const origW = codeModalSize.width, origH = codeModalSize.height;
+    const onMove = (ev) => setCodeModalSize({
+      width: Math.max(380, origW + (ev.clientX - startX)),
+      height: Math.max(260, origH + (ev.clientY - startY)),
+    });
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }, [codeModalSize, codeModalMaximized]);
+
+  useEffect(() => {
+    fetch("/api/code-repos").then((r) => r.json()).then((d) => { if (d.ok) setCodeModeRepos((d.repos || []).filter((r) => r.enabled)); }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    setCodeModeBranch("");
+    setCodeModeBranches([]);
+    setCodeModeFiles([]);
+    setCodeModeAvailableFiles([]);
+    setCodeSession(null); // trocou de repositório — a sessão de continuação (branch/PR em andamento) não faz mais sentido
+    if (!codeModeRepo) return;
+    fetch(`/api/code-repos/branches?repo=${encodeURIComponent(codeModeRepo)}`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.ok) {
+          setCodeModeBranches(d.branches || []);
+          const found = codeModeRepos.find((r) => r.full_name === codeModeRepo);
+          setCodeModeBranch(found?.default_branch && d.branches.includes(found.default_branch) ? found.default_branch : d.branches[0] || "");
+        }
+      })
+      .catch(() => {});
+    fetch(`/api/code-repos/files?repo=${encodeURIComponent(codeModeRepo)}`)
+      .then((r) => r.json())
+      .then((d) => { if (d.ok) setCodeModeAvailableFiles(d.files || []); })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [codeModeRepo]);
+
+  // Visão do avatar: "traditional" (visualizador de onda de sempre) ou "3d" (corpo/modelo 3D,
+  // ver LisaAvatar3D.js) — DESKTOP-ONLY de propósito (o toggle só existe no branch desktop
+  // deste componente, então nunca aparece nem carrega no mobile).
+  // "esfera" (padrão desde a revisão visual de out/2026, ver EsferaDaVoz.js) também vale.
+  const [avatarView, setAvatarView] = useState("esfera");
+  // com avatarView "esfera": QUAL visual reage à voz (Esfera de pontos, Lente, Orbe, Plasma ou
+  // Anel — src/lib/visuaisDaLisa.js), escolhido no painel /visual ou no menu de aparência. O usuário
+  // do MVP só tem a Esfera de pontos e o Rosto (visualDoUsuario), sem gravar nada: o navegador pode
+  // ser o mesmo do admin, e a escolha dele continua guardada.
+  const visualEscolhido = usarVisualEscolhido();
+  const visualDaLisa = usuario ? visualDoUsuario(visualEscolhido) : visualEscolhido;
+  const ajustesDoRosto = usarAjustesDoRosto(); // o cabelo e as cores, quando o visual é o Rosto
+  // qual "corpo" 3D usar quando avatarView === "3d" — "cyborg" (original, sem esqueleto) ou
+  // "rigado" (o seu modelo do Mixamo, com gestos de verdade por modo, ver LisaAvatarRigado.js)
+  const [avatarSkin, setAvatarSkin] = useState("cyborg");
+
+  // ---- mobile: tela própria, só o Assistente (ver Shell.js) ----
+  const isMobile = useIsMobile();
+  const [mobileView, setMobileView] = useState("chat"); // "chat" | "voice"
+  const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
+  // gravando a fala pelo microfone do celular (MicrofoneDaLisa): a esfera escuta, e o "</> editor"
+  // flutuante sai do caminho (globals.css: body.bb-gravando-fala, body[data-celular])
+  const [gravandoFala, setGravandoFala] = useState(false);
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    document.body.classList.toggle("bb-gravando-fala", gravandoFala);
+    if (isMobile) document.body.dataset.celular = mobileView;
+    else delete document.body.dataset.celular;
+    return () => { document.body.classList.remove("bb-gravando-fala"); delete document.body.dataset.celular; };
+  }, [gravandoFala, isMobile, mobileView]);
+  // no mobile o Assistente é tela cheia (sem Sidebar/Topbar — ver Shell.js), então essas são
+  // as ÚNICAS abas que existem nesse modo: sem esse atalho, não tem como chegar nos outros
+  // painéis (Dashboard, AR, Quarto de Guerra, etc.) a partir do celular.
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [messages, setMessages] = useState([]); // histórico visível no modo chat (não é o mesmo que historyRef, que só guarda o último turno pra ações)
+  const [accentName, setAccentName] = useState(DEFAULT_ACCENT.name);
+  const [ingesting, setIngesting] = useState(false);
+  const [autoSync, setAutoSync] = useState(null);
+  const messagesEndRef = useRef(null);
+
+  const recognitionRef = useRef(null);
+  const answerRef = useRef("");
+  const fontesRef = useRef([]);
+  // última pergunta+cards e ação proposta ainda não confirmada — mandados de volta pro
+  // backend a cada pergunta nova, pra ele saber a que card "reprograme pra amanhã" se refere
+  // e se a mensagem atual está confirmando/cancelando uma ação (ver /api/ask).
+  const historyRef = useRef(null);
+  // As últimas trocas (BEYOND-0006): vão junto com cada pergunta para a Lisa continuar o
+  // assunto. Inclui o que ela comenta sozinha (tela, câmera, escuta) — "por quê?" logo depois
+  // de um comentário dela precisa saber de qual comentário se trata.
+  const conversaRef = useRef([]);
+  // A última fala INTEIRA dela (a memória corta cada fala): "cria um card com esse texto" usa esta.
+  const ultimaRespostaRef = useRef("");
+  const lembrarDaLisa = (texto) => { conversaRef.current = adicionarTurno(conversaVigente(conversaRef.current), "lisa", texto); ultimaRespostaRef.current = String(texto || ""); };
+  const pendingActionRef = useRef(null);
+
+  // ---- o contexto da conversa (25/10/2026): imagens anexadas e repositórios vinculados ----
+  // Pedido: "ponha um + na barra de conversa e deixe eu colar imagens lá, tanto do PC como do
+  // Ctrl+C/Ctrl+V; além disso, a função de eu vincular repositórios — além da conversa e do que
+  // ela estiver vendo em tela e câmera, ela usa essas informações de contexto, inclusive
+  // conseguindo correlacioná-las". Não é um modo nem um escopo: vale em qualquer conversa e vai
+  // junto de cada pergunta até a pessoa tirar. Os repositórios ficam guardados neste navegador
+  // (sobrevivem ao recarregar); as imagens, só nesta visita (são grandes).
+  const [anexos, setAnexos] = useState([]);
+  const [preparandoAnexos, setPreparandoAnexos] = useState(0);
+  const [reposVinculados, setReposVinculados] = useState([]);
+  const [leituraDosRepos, setLeituraDosRepos] = useState(null);
+  const anexosRef = useRef([]);
+  anexosRef.current = anexos;
+  const reposRef = useRef([]);
+  reposRef.current = reposVinculados;
+  useEffect(() => {
+    try { setReposVinculados(vinculosValidos(JSON.parse(localStorage.getItem("lisa-repos-vinculados") || "[]"))); } catch { /* nada guardado */ }
+  }, []);
+  const guardarRepos = useCallback((lista) => {
+    reposRef.current = lista;
+    setReposVinculados(lista);
+    try { localStorage.setItem("lisa-repos-vinculados", JSON.stringify(lista)); } catch { /* sem armazenamento: vale só nesta visita */ }
+  }, []);
+  const anexarImagens = useCallback(async (arquivos) => {
+    const cabem = Math.max(0, MAX_ANEXOS - anexosRef.current.length);
+    const lista = (arquivos || []).slice(0, cabem);
+    if ((arquivos || []).length > cabem) addLog("[ANEXO]", OR, `no máximo ${MAX_ANEXOS} imagens no contexto — tire alguma para pôr outra`);
+    if (!lista.length) return;
+    setPreparandoAnexos((n) => n + lista.length);
+    for (const arquivo of lista) {
+      try {
+        const a = await imagemParaAnexo(arquivo);
+        setAnexos((atual) => (atual.length >= MAX_ANEXOS ? atual : [...atual, a]));
+        addLog("[ANEXO]", GR, `${a.nome} · ${a.largura}×${a.altura} no contexto`);
+      } catch (err) {
+        addLog("[ANEXO]", OR, err.message);
+      } finally {
+        setPreparandoAnexos((n) => Math.max(0, n - 1));
+      }
+    }
+  }, [addLog]);
+  const vincularRepo = useCallback((r) => {
+    // o mais novo primeiro: passando do limite, sai o mais antigo
+    guardarRepos(vinculosValidos([r, ...reposRef.current.filter((x) => x.repo.toLowerCase() !== r.repo.toLowerCase())]));
+    setLeituraDosRepos(null);
+    addLog("[REPO]", PU, `vinculado: ${r.repo}${r.branch ? `@${r.branch}` : ""} — a Lisa lê o código a cada pergunta`);
+  }, [guardarRepos, addLog]);
+  const desvincularRepo = useCallback((repo) => {
+    guardarRepos(reposRef.current.filter((x) => x.repo.toLowerCase() !== repo.toLowerCase()));
+    addLog("[REPO]", PU, `desvinculado: ${repo}`);
+  }, [guardarRepos, addLog]);
+  const limparContexto = useCallback(() => {
+    setAnexos([]);
+    guardarRepos([]);
+    setLeituraDosRepos(null);
+  }, [guardarRepos]);
+  // Ctrl+V com imagem e arrastar imagem para a tela: viram anexos (texto colado segue normal)
+  useEffect(() => {
+    const colar = (e) => { const imgs = imagensDaColagem(e); if (!imgs.length) return; e.preventDefault(); anexarImagens(imgs); };
+    const sobre = (e) => { if ([...(e.dataTransfer?.types || [])].includes("Files")) e.preventDefault(); };
+    const soltar = (e) => { const imgs = imagensSoltas(e); if (!imgs.length) return; e.preventDefault(); anexarImagens(imgs); };
+    document.addEventListener("paste", colar);
+    window.addEventListener("dragover", sobre);
+    window.addEventListener("drop", soltar);
+    return () => {
+      document.removeEventListener("paste", colar);
+      window.removeEventListener("dragover", sobre);
+      window.removeEventListener("drop", soltar);
+    };
+  }, [anexarImagens]);
+  const faixaDoContexto = (
+    <FaixaDoContexto
+      anexos={anexos} repos={reposVinculados} leitura={leituraDosRepos} preparando={preparandoAnexos}
+      aoRemoverAnexo={(id) => setAnexos((atual) => atual.filter((a) => a.id !== id))}
+      aoDesvincular={desvincularRepo} aoLimpar={limparContexto}
+    />
+  );
+
+  const audioRef = useRef(null);
+  const currentAudioResolveRef = useRef(null);
+
+  // fila de TTS. HISTÓRICO: houve uma época de "1 chamada por resposta, mandada só quando a
+  // resposta terminava de chegar", porque cabeça e resto decididos quase-independentemente
+  // saíam às vezes com duas vozes diferentes. Depois vieram os pedaços (BEYOND-0001) com a
+  // fila de DECISÃO (engineDecisionRef) e a voz travada por resposta (speechEngineRef): o
+  // primeiro pedaço decide, e se ele cair para o navegador, o resto da MESMA resposta fica no
+  // navegador. Com isso garantido, a fala ao vivo (07/11/2026, src/lib/falaAoVivo.js) passou a
+  // mandar cada frase completa para esta mesma fila enquanto a resposta ainda chega.
+  const speechQueueRef = useRef(Promise.resolve()); // ordem de REPRODUÇÃO (espera o áudio anterior acabar de tocar)
+  // ordem de DECISÃO do motor (gemini/navegador) entre RESPOSTAS diferentes — evita que uma
+  // pergunta nova decida seu motor antes da anterior ainda estar sendo decidida.
+  const engineDecisionRef = useRef(Promise.resolve());
+  const speechGenRef = useRef(0); // pergunta nova invalida pedaços pendentes de uma pergunta antiga
+  // voz "travada" pra resposta atual: null = ainda não decidiu, "gemini" ou "browser".
+  // A cabeça decide; se cair pro navegador, o resto desta MESMA resposta continua no
+  // navegador (nunca alterna de novo dentro da mesma resposta).
+  const speechEngineRef = useRef(null);
+
+  const canvasRef = useRef(null);
+  const modeRef = useRef(mode);
+
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+
+  // lista de boards pro seletor de escopo "Este painel" (Quarto de Guerra + os demais indexados)
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/boards-overview")
+      .then((r) => r.json())
+      .then((d) => {
+        if (!alive || !d.ok) return;
+        setPanelOptions([QUADRO_PRINCIPAL, ...(d.boards || []).map((b) => b.board)]);
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
+  // carrega a voz escolhida antes (se houver) — cada navegador guarda a sua
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const saved = localStorage.getItem("voiceName");
+    if (saved) setVoiceName(saved);
+  }, []);
+
+  // carrega se o Modo Persona estava ligado — cada navegador guarda o seu
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setPersonaMode(localStorage.getItem("personaMode") === "1");
+  }, []);
+
+  const togglePersonaMode = useCallback(() => {
+    setPersonaMode((v) => {
+      const next = !v;
+      if (typeof window !== "undefined") localStorage.setItem("personaMode", next ? "1" : "0");
+      return next;
+    });
+  }, []);
+
+  // ---- Modo Observância: a Lisa "vê" pela câmera (getUserMedia) e pode descrever o que
+  // enxerga — postura, cor de roupa, gesto com a mão, expressão — junto com a resposta de
+  // texto normal (mesma pergunta ao Gemini, agora com uma foto anexada). DESLIGADO por
+  // padrão e de propósito SEM localStorage: é câmera apontada pra você, então cada sessão
+  // pede de novo — não fica "ligado sozinho" na próxima vez que abrir o app. Não manda vídeo
+  // contínuo nem guarda nada — só tira 1 foto no instante de cada pergunta, manda pro Gemini
+  // responder, e descarta (não é salva em lugar nenhum, nem local nem no Supabase).
+  const [observanceMode, setObservanceMode] = useState(false);
+  const [observanceError, setObservanceError] = useState(null);
+  // "user" = frontal, "environment" = traseira — só faz diferença de verdade no celular (a
+  // maioria dos notebooks só tem uma câmera). Não persiste em localStorage de propósito,
+  // mesmo motivo do resto do Modo Observância: cada sessão começa do mesmo jeito.
+  const [cameraFacing, setCameraFacing] = useState("user");
+  const observanceVideoRef = useRef(null);
+  const observanceStreamRef = useRef(null);
+
+  // Modo Escuta: microfone fica de verdade aberto (não é o push-to-talk de sempre) ENQUANTO o
+  // Modo Tela ou a Observância estiverem ligados — nunca sozinho, foi assim que o usuário
+  // pediu. Grava pedacinhos curtos, manda pro Gemini analisar (pode comentar se estiver
+  // cantando bem, algo interessante ouvido, etc.) e descarta — nada de áudio fica salvo em
+  // lugar nenhum. Sem localStorage de propósito, mesmo motivo da Observância: sessão nova
+  // sempre começa com o mic desligado, nunca "liga sozinho".
+  const [micWatchMode, setMicWatchMode] = useState(false);
+  const [micWatchError, setMicWatchError] = useState(null);
+  const micWatchStreamRef = useRef(null);
+
+  // Câmera de Vigia: como o Modo Tela + Transmissão, só que com a câmera do dispositivo no
+  // lugar da tela — grava com ÁUDIO junto (pra servir de monitor de ambiente, tipo babá
+  // eletrônica) e transmite ao vivo pra quem estiver assistindo no Modo Vigia de outro
+  // dispositivo (canal "camera", ver src/lib/screenShareRTC.js — mesma infra da Transmissão de
+  // tela, só um canal diferente). Quem assiste pode mandar mensagens de texto que a Lisa lê em
+  // voz alta e mostra na tela de quem está com a câmera ligada — tipo um interfone.
+  const [cameraVigiaMode, setCameraVigiaMode] = useState(false);
+  const [cameraVigiaError, setCameraVigiaError] = useState(null);
+  const cameraVigiaVideoRef = useRef(null);
+  const cameraVigiaStreamRef = useRef(null);
+  const screenShareCameraHostRef = useRef(null);
+  const [cameraVigiaIncomingMsg, setCameraVigiaIncomingMsg] = useState(null);
+
+  // Modo Rádio: a Lisa incorpora uma apresentadora de rádio, alternando blocos de locução
+  // (novidades reais de Abacato/Tarefas do trabalho/Sentinela/Pensamentos, categoria sorteada) com
+  // música de verdade da playlist (radio/playlist.txt, tocada via YouTube IFrame API — ver
+  // src/lib/youtubePlayer.js). Ela anuncia a música antes de tocar e comenta depois que acaba.
+  const RADIO_CATEGORIES = ["trello", "work", "sentinel", "thoughts", "weather", "news"];
+  const RADIO_CATEGORY_LABELS = { trello: "Abacato", work: "Tarefas do trabalho", sentinel: "Sentinela", thoughts: "pensamentos", weather: "previsão do tempo", news: "notícias (com o Steve)" };
+  // Modo Interativo — a Lisa como robozinho de mesa: tela limpa, carinha de LED fazendo graça
+  // sozinha (ver LisaPixelFace.js), e de vez em quando ela puxa assunto com algo REAL. A câmera
+  // fica ligada só pelo gesto ✌️ de acordar, que já roda 100% local no navegador (MediaPipe em
+  // public/mediapipe/) — nenhum quadro sai da máquina pra isso.
+  const INTERACTIVE_CATEGORIES = ["trello", "work", "sentinel", "thoughts", "news"];
+  // cara que ela faz ao trazer cada assunto — determinístico de propósito (pedir a expressão pro
+  // modelo junto do texto exigiria parsear a resposta dele, que é frágil por nada).
+  const INTERACTIVE_FACE_BY_CATEGORY = { trello: "bored", work: "thinking", sentinel: "surprised", thoughts: "curious", news: "happy" };
+  // nome que aparece ao lado da carinha no desktop quando uma atividade está aberta
+  const INTERACTIVE_LABELS = {
+    velha: "JOGO DA VELHA", pong: "PONG", penalti: "COBRANÇA DE PÊNALTI", lig4: "LIG 4",
+    naval: "BATALHA NAVAL", memoria: "JOGO DA MEMÓRIA", airhockey: "AIR HOCKEY",
+    reflexo: "DUELO DE REFLEXO", ppt: "PEDRA-PAPEL-TESOURA", quiz: "QUIZ DE PROGRAMAÇÃO",
+    pair: "PAIR PROGRAMMING", disco: "LANÇAR DISCO PRA PIPOCA", mundo: "MUNDO DA LISA",
+  };
+  const [interactiveMode, setInteractiveMode] = useState(false);
+  const [tomarNota, setTomarNota] = useState(null); // { tema } com o painel do Modo Tomar nota aberto
+  const instalacao = usarInstalacao();
+  // O atalho "Tomar nota" do app instalado (segurar o ícone, no Android) abre /assistant?modo=tomar-nota.
+  // O parâmetro sai do endereço logo depois, para recarregar a página não reabrir o modo.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("modo") !== "tomar-nota") return;
+    setTomarNota({ tema: "" });
+    url.searchParams.delete("modo");
+    window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+  }, []);
+  const [interactiveBubble, setInteractiveBubble] = useState(null); // { text, category } | null
+  const [interactiveFace, setInteractiveFace] = useState(null); // expressão forçada, ou null = ela faz o que quiser
+  const [interactiveSpeaking, setInteractiveSpeaking] = useState(false); // move a boca enquanto a fala toca
+  const [perceivedFace, setPerceivedFace] = useState(null); // cara que ela faz reagindo ao que VÊ (ver facePerception.js)
+  const [interactiveMenuOpen, setInteractiveMenuOpen] = useState(false);
+  const [interactiveGame, setInteractiveGame] = useState(null); // null | "velha" | "pong"
+  // O Pair Programming abre numa JANELA SÓ DELE (rota /pair, fora do grupo (panels), sem
+  // Sidebar/Topbar): a IDE precisa de tela, e aqui dentro ela divide espaço com a carinha, o
+  // menu e o plano — não sobra nada pra programar.
+  const [pairWindowBlocked, setPairWindowBlocked] = useState(false);
+  // o Mundo da Lisa também: isométrico, rolável e de tela cheia não cabe no painel
+  const [worldWindowBlocked, setWorldWindowBlocked] = useState(false);
+  const [gameStats, setGameStats] = useState(null); // { score, history } — lido ao abrir o menu
+  const [activityStats, setActivityStats] = useState(null); // pontos de quiz/pair (ver /api/activities)
+  const interactiveBagRef = useRef([]); // mesmo "saco embaralhado" do rádio: passa por todas antes de repetir
+  const interactiveSeenRef = useRef({}); // itens já comentados por categoria (anti-repetição, ver pendingWork.js)
+  const interactiveGameRef = useRef(null); // espelho de interactiveGame pro laço de falas não precisar dele nas dependências
+
+  /** Abre (ou traz pra frente) a janela do Pair Programming, já do tamanho da tela. A tela cheia
+   * de verdade quem pede é a própria /pair, no primeiro gesto lá dentro — navegador nenhum
+   * concede fullscreen a uma janela que acabou de abrir sozinha. */
+  const openPairWindow = useCallback(() => {
+    const w = Math.max(900, window.screen?.availWidth || 1280);
+    const h = Math.max(600, window.screen?.availHeight || 800);
+    const win = window.open("/pair", "lisa-pair", `popup=yes,width=${w},height=${h},left=0,top=0`);
+    setPairWindowBlocked(!win); // bloqueador de pop-up: o painel mostra o link manual
+    win?.focus();
+  }, []);
+
+  /** Mesma ideia pro Mundo da Lisa. */
+  const openWorldWindow = useCallback(() => {
+    const w = Math.max(900, window.screen?.availWidth || 1280);
+    const h = Math.max(600, window.screen?.availHeight || 800);
+    const win = window.open("/mundo", "lisa-mundo", `popup=yes,width=${w},height=${h},left=0,top=0`);
+    setWorldWindowBlocked(!win);
+    win?.focus();
+  }, []);
+
+  const [radioMode, setRadioMode] = useState(false);
+  const [radioStatus, setRadioStatus] = useState(null); // texto curto pro widget flutuante
+  const [radioNowPlaying, setRadioNowPlaying] = useState(null); // {title} | null
+  const radioContainerRef = useRef(null); // <div> onde o player do YouTube é montado
+  const radioPlayerRef = useRef(null); // instância YT.Player (uma só, reaproveitada entre músicas)
+  const radioPlaylistRef = useRef([]);
+  const radioRecentRef = useRef([]); // últimos videoIds tocados — evita repetir em sequência
+  const radioCategoryBagRef = useRef([]); // "saco" embaralhado das categorias — garante passar por TODAS antes de repetir qualquer uma
+  const radioSeenKeysRef = useRef({}); // { trello: [...ids...], work: [...], sentinel: [...], thoughts: [...], news: [...] } — itens já mencionados nesta sessão, pra pickVaried (pendingWork.js) evitar repeti-los enquanto houver opção nova
+  const radioStateHandlerRef = useRef(null); // ver playAndWaitEnded
+  const radioSkipRef = useRef(null); // preenchida enquanto uma música toca — ver botão "pular" no radioWidget
+
+  // ---- Modo Escuta por palavra ("Lisa, ...") ----
+  const [escutaPalavra, setEscutaPalavra] = useState(false);
+  const [escutaEstado, setEscutaEstado] = useState("dormindo"); // dormindo | acordada | ocupada
+  // Modo conversa (BEYOND-0006): microfone aberto, ela responde quando você fala e fica quieta
+  // no silêncio. Exclusivo com a escuta por palavra — os dois abririam o microfone ao mesmo tempo.
+  const [conversaAberta, setConversaAberta] = useState(false);
+  const [conversaEstado, setConversaEstado] = useState("desligada"); // desligada | ouvindo | respondendo
+  const conversaAbertaRef = useRef(false);
+  conversaAbertaRef.current = conversaAberta;
+  useEffect(() => { if (conversaAberta) setEscutaPalavra(false); }, [conversaAberta]);
+  useEffect(() => { if (escutaPalavra) setConversaAberta(false); }, [escutaPalavra]);
+  // Fila de UM pedido só. O laço do rádio a consome na próxima escolha de música, em vez
+  // de sortear. Uma fila maior não ajudaria: pedir duas músicas de uma vez não é como
+  // ninguém fala, e a segunda chegaria minutos depois, quando o pedido já não faz sentido.
+  const pedidoDeMusicaRef = useRef(null);
+
+  useEffect(() => {
+    if (!radioMode) { setRadioStatus(null); setRadioNowPlaying(null); return; }
+    let stopped = false;
+
+    const speakRadio = async (text, voiceOverride) => {
+      if (!text || stopped) return;
+      // trava a vez (mesmo mecanismo que a vigília do Modo Tela/Observância já usa entre si) —
+      // sem isso, a vigília delas podia disparar NO MEIO da fala do rádio e cortar o áudio dela
+      // (speakText cancela qualquer fala anterior antes de começar uma nova, ver browserVoice.js)
+      // — bug real visto: rádio "pulava" ou parava no meio do comentário sem motivo aparente.
+      proactiveTurnRef.current = true;
+      try {
+        // timeout de segurança bem folgado (120s, não 30s) — um bloco mais falado (várias
+        // tarefas com data) pode legitimamente passar de 30-40s pra ler inteiro; um prazo curto
+        // demais disparava ENQUANTO ela ainda falava, e o bloco seguinte cortava o áudio no meio
+        // (bug real visto: "corta e já pula pro próximo" — não era outra vigília, era esse
+        // prazo). Isso aqui só existe pra não travar pra sempre se algo really der errado.
+        await Promise.race([
+          speakText(text, { voiceName: voiceOverride || voiceNameForScreenRef.current }).catch(() => {}),
+          new Promise((r) => setTimeout(r, 120000)),
+        ]);
+      } finally {
+        proactiveTurnRef.current = false;
+      }
+    };
+
+    const fetchSegment = async (body) => {
+      try {
+        const res = await fetch("/api/radio/segment", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+        const data = await res.json();
+        return data?.ok ? data.text : null;
+      } catch (err) {
+        addLog("[RÁDIO]", OR, `falha ao gerar locução: ${err.message}`);
+        return null;
+      }
+    };
+
+    // "saco" embaralhado: garante passar pelas 6 categorias (em ordem aleatória) antes de
+    // repetir qualquer uma — mais forte que só "evitar as últimas faladas", que ainda deixava
+    // uma categoria voltar cedo demais por puro azar do sorteio (bug real reportado pelo
+    // usuário: "repetem muito mais assunto").
+    const pickCategory = () => {
+      if (!radioCategoryBagRef.current.length) {
+        radioCategoryBagRef.current = [...RADIO_CATEGORIES].sort(() => Math.random() - 0.5);
+      }
+      return radioCategoryBagRef.current.shift();
+    };
+
+    // busca um bloco de locução "talk", mandando quais itens dessa categoria já foram
+    // mencionados nesta sessão (radioSeenKeysRef) — o servidor (pendingWork.js) prioriza sortear
+    // itens AINDA NÃO ditos, só repetindo quando não sobra nenhum inédito. Sem isso, mesmo com
+    // amostragem aleatória, o mesmo item real podia sair de novo cedo demais por azar (bug real
+    // reportado: "tanta notícia/tarefa pra falar" e ainda assim repetindo sempre as mesmas).
+    const fetchTalk = async (category) => {
+      const excludeKeys = radioSeenKeysRef.current[category] || [];
+      try {
+        const res = await fetch("/api/radio/segment", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ kind: "talk", category, excludeKeys }),
+        });
+        const data = await res.json();
+        if (!data?.ok) return null;
+        if (data.usedKeys?.length) {
+          radioSeenKeysRef.current[category] = [...excludeKeys, ...data.usedKeys].slice(-200);
+        }
+        return data.text;
+      } catch (err) {
+        addLog("[RÁDIO]", OR, `falha ao gerar locução: ${err.message}`);
+        return null;
+      }
+    };
+
+    const pickSong = () => {
+      // Pedido falado tem precedência sobre o sorteio — é o "toca aquela do Pink Floyd".
+      const pedido = pedidoDeMusicaRef.current;
+      if (pedido) {
+        pedidoDeMusicaRef.current = null;
+        radioRecentRef.current = [...radioRecentRef.current, pedido.videoId];
+        return pedido;
+      }
+      const list = radioPlaylistRef.current;
+      if (!list.length) return null;
+      const recent = radioRecentRef.current;
+      const candidates = list.filter((s) => !recent.includes(s.videoId));
+      const pool = candidates.length ? candidates : list; // já tocou tudo recentemente — libera de novo
+      const song = pool[Math.floor(Math.random() * pool.length)];
+      radioRecentRef.current = [...recent.slice(-Math.max(0, list.length - 2)), song.videoId];
+      return song;
+    };
+
+    const run = async () => {
+      if (!radioPlaylistRef.current.length) {
+        try {
+          const res = await fetch("/api/radio/playlist");
+          const data = await res.json();
+          radioPlaylistRef.current = data?.ok ? data.playlist : [];
+          if (!radioPlaylistRef.current.length) addLog("[RÁDIO]", OR, "playlist vazia ou radio/playlist.txt não encontrado");
+        } catch (err) {
+          addLog("[RÁDIO]", OR, `falha ao carregar playlist: ${err.message}`);
+        }
+      }
+      await loadYouTubeAPI();
+      if (stopped) return;
+      if (!radioPlayerRef.current && radioContainerRef.current) {
+        radioPlayerRef.current = await createYouTubePlayer(radioContainerRef.current, {
+          onStateChange: (e) => radioStateHandlerRef.current?.(e),
+        });
+      }
+
+      while (!stopped) {
+        // bloco de locução — categoria sorteada (evitando repetir as últimas faladas)
+        const category = pickCategory();
+        if (category === "news") {
+          // notícias viram um "quadro" com o Steve: a Lisa chama ele, ele lê as manchetes com a
+          // voz dele, e a Lisa comenta o que ele falou antes de seguir — como uma transição de
+          // rádio de verdade entre apresentadores, não só um bloco narrado com voz diferente.
+          setRadioStatus("chamando o Steve…");
+          const intro = await fetchSegment({ kind: "introduce-steve" });
+          if (stopped) break;
+          addLog("[RÁDIO]", PU, intro || "(Lisa chama o Steve)");
+          await speakRadio(intro);
+          if (stopped) break;
+
+          setRadioStatus("Steve com as notícias…");
+          const steveTalk = await fetchTalk(category);
+          if (stopped) break;
+          addLog("[RÁDIO]", PU, `[STEVE] ${steveTalk || "(sem notícias desta vez)"}`);
+          await speakRadio(steveTalk, STEVE_VOICE_NAME);
+          if (stopped) break;
+
+          if (steveTalk) {
+            setRadioStatus("comentando com o Steve…");
+            const reaction = await fetchSegment({ kind: "comment-steve", sourceText: steveTalk });
+            if (stopped) break;
+            addLog("[RÁDIO]", PU, reaction || "(sem comentário desta vez)");
+            await speakRadio(reaction);
+            if (stopped) break;
+          }
+        } else {
+          setRadioStatus(`falando sobre ${RADIO_CATEGORY_LABELS[category] || category}…`);
+          const talk = await fetchTalk(category);
+          if (stopped) break;
+          addLog("[RÁDIO]", PU, talk || "(sem locução desta vez)");
+          await speakRadio(talk);
+          if (stopped) break;
+        }
+
+        // bloco de música — só se a playlist carregou e o player está pronto
+        const song = pickSong();
+        if (song && radioPlayerRef.current) {
+          setRadioStatus("anunciando a música…");
+          const announce = await fetchSegment({ kind: "announce", songTitle: song.title });
+          if (stopped) break;
+          addLog("[RÁDIO]", PU, announce || `(tocando ${song.title})`);
+          await speakRadio(announce);
+          if (stopped) break;
+          setRadioNowPlaying(song);
+          setRadioStatus(`tocando: ${song.title}`);
+          await playAndWaitEnded(radioPlayerRef.current, song.videoId, radioStateHandlerRef, radioSkipRef);
+          setRadioNowPlaying(null);
+          if (stopped) break;
+          setRadioStatus("comentando a música…");
+          const comment = await fetchSegment({ kind: "comment", songTitle: song.title });
+          if (stopped) break;
+          addLog("[RÁDIO]", PU, comment || "(sem comentário desta vez)");
+          await speakRadio(comment);
+        }
+      }
+    };
+    run();
+
+    return () => {
+      stopped = true;
+      radioStateHandlerRef.current = null;
+      radioSkipRef.current = null;
+      radioPlayerRef.current?.stopVideo?.();
+    };
+  }, [radioMode, addLog]);
+
+  // Modo Interativo: de ~2 em ~2 min ela puxa assunto sozinha com algo REAL (categoria sorteada
+  // no "saco embaralhado", itens já comentados ficam de fora — ver /api/companion/remark).
+  useEffect(() => {
+    // De fone (Modo Rádio), ela NÃO puxa assunto: a voz do rádio já é a voz dela ali, e a fala
+    // espontânea entrava por cima. A trava proactiveTurnRef sozinha não resolvia isso porque a
+    // checagem acontecia ANTES do fetch — quando o texto ficava pronto, segundos depois, o rádio
+    // podia já ter começado a falar (clássico check-then-act).
+    if (!interactiveMode || radioMode) {
+      setInteractiveBubble(null);
+      setInteractiveFace(null);
+      return;
+    }
+    let stopped = false;
+    let timer = null;
+
+    const pickCategory = () => {
+      if (!interactiveBagRef.current.length) {
+        interactiveBagRef.current = [...INTERACTIVE_CATEGORIES].sort(() => Math.random() - 0.5);
+      }
+      return interactiveBagRef.current.shift();
+    };
+
+    const schedule = () => {
+      if (!stopped) timer = setTimeout(tick, 120000);
+    };
+
+    async function tick() {
+      if (stopped) return;
+      // ela não atropela nada: se está ocupada, falando, VOCÊ está no microfone, ou tem jogo em
+      // andamento (puxar assunto no meio da partida é atrapalhar), passa a vez
+      if (busyForGestureRef.current || listeningForGestureRef.current || proactiveTurnRef.current || interactiveGameRef.current) {
+        schedule();
+        return;
+      }
+      const category = pickCategory();
+      try {
+        const res = await fetch("/api/companion/remark", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ category, excludeKeys: interactiveSeenRef.current[category] || [] }),
+        });
+        const data = await res.json();
+        if (stopped) return;
+        if (data?.ok && data.text) {
+          if (data.usedKeys?.length) {
+            interactiveSeenRef.current[category] = [...(interactiveSeenRef.current[category] || []), ...data.usedKeys].slice(-200);
+          }
+          setInteractiveBubble({ text: data.text, category });
+          setInteractiveFace(INTERACTIVE_FACE_BY_CATEGORY[category] || "curious");
+          addLog("[INTERATIVO]", PU, data.text);
+          // RE-CHECA a trava agora, não só antes do fetch: entre pedir o texto e ele chegar
+          // (segundos), outra vigília ou o rádio podem ter começado a falar. Sem isto, as duas
+          // vozes saíam juntas.
+          if (voiceOnForScreenRef.current && !proactiveTurnRef.current) {
+            proactiveTurnRef.current = true; // mesma trava das outras vigílias — senão uma fala corta a outra
+            setInteractiveSpeaking(true);
+            try {
+              await Promise.race([
+                speakText(data.text, { voiceName: voiceNameForScreenRef.current }).catch(() => {}),
+                new Promise((r) => setTimeout(r, 60000)),
+              ]);
+            } finally {
+              proactiveTurnRef.current = false;
+              setInteractiveSpeaking(false);
+            }
+          }
+          if (!stopped) {
+            setInteractiveFace(null); // solta a cara — volta a fazer graça sozinha
+            setTimeout(() => { if (!stopped) setInteractiveBubble(null); }, 12000);
+          }
+        }
+      } catch (err) {
+        addLog("[INTERATIVO]", OR, `falha ao buscar assunto: ${err.message}`);
+      }
+      schedule();
+    }
+
+    schedule();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [interactiveMode, addLog]);
+
+  interactiveGameRef.current = interactiveGame;
+
+  // cara que ela faz durante os jogos — a mesma para todos, e sempre TEMPORÁRIA: solta depois
+  // de um tempo pra ela voltar a fazer as graças dela em vez de congelar na última reação.
+  const gameMood = useCallback((m) => {
+    setInteractiveFace(m);
+    setTimeout(() => setInteractiveFace(null), 2400);
+  }, []);
+
+  // reação à troca de música quando ela está de fone (Modo Rádio dentro do Interativo)
+  useEffect(() => {
+    if (!interactiveMode || !radioMode || !radioNowPlaying) return;
+    setInteractiveFace("jam"); // música nova: ela se empolga
+    const id = setTimeout(() => setInteractiveFace(null), 2500);
+    return () => clearTimeout(id);
+  }, [interactiveMode, radioMode, radioNowPlaying]);
+
+  // Ela REAGE ao que vê: expressão do seu rosto (blendshapes do MediaPipe) + ambiente (luz,
+  // movimento, quantas pessoas) — tudo local, nenhum quadro sai da máquina e não gasta cota do
+  // Gemini (ver src/lib/facePerception.js pra o porquê dessa escolha).
+  useEffect(() => {
+    // de fone ela fica no mundo dela: não observa o ambiente (foi o pedido do Modo Rádio)
+    if (!interactiveMode || radioMode) {
+      setPerceivedFace(null);
+      return;
+    }
+    let cancelled = false;
+    let perception = null;
+    let intervalId = null;
+
+    (async () => {
+      const { createFacePerception } = await import("@/lib/facePerception.js");
+      perception = await createFacePerception();
+      if (cancelled) {
+        perception?.close();
+        return;
+      }
+      if (!perception) {
+        addLog("[INTERATIVO]", OR, "não consegui carregar a leitura de expressão — ela segue fazendo as caras dela sozinha");
+        return;
+      }
+      addLog("[INTERATIVO]", GR, "lendo sua expressão e o ambiente (local, nada sai daqui)");
+      intervalId = setInterval(() => {
+        const face = perception.read(observanceVideoRef.current);
+        setPerceivedFace((prev) => (prev === face ? prev : face)); // só re-renderiza quando muda de verdade
+      }, 250);
+    })();
+
+    return () => {
+      cancelled = true;
+      if (intervalId) clearInterval(intervalId);
+      perception?.close();
+    };
+  }, [interactiveMode, radioMode, addLog]);
+
+  // no mobile a view "companion" É o modo: entrar liga, sair desliga. Sem isso a câmera e o laço
+  // ficariam rodando enquanto você está lendo o chat em outra aba, sem nem ver a carinha.
+  useEffect(() => {
+    if (!isMobile) return;
+    setInteractiveMode(mobileView === "companion");
+  }, [isMobile, mobileView]);
+
+  // a câmera serve à Observância E ao Modo Interativo (que precisa dela só pro gesto de acordar)
+  useEffect(() => {
+    if (!observanceMode && !interactiveMode) {
+      observanceStreamRef.current?.getTracks().forEach((t) => t.stop());
+      observanceStreamRef.current = null;
+      return;
+    }
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setObservanceError("este navegador não dá acesso à câmera");
+      setObservanceMode(false);
+      return;
+    }
+    let cancelled = false;
+    setObservanceError(null);
+    // "ideal" (não "exact") — em aparelho sem câmera traseira de verdade, cai pra qualquer
+    // câmera disponível em vez de falhar com OverconstrainedError.
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: cameraFacing } }, audio: false })
+      .then((stream) => {
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        observanceStreamRef.current = stream;
+        if (observanceVideoRef.current) {
+          observanceVideoRef.current.srcObject = stream;
+          observanceVideoRef.current.play().catch(() => {});
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setObservanceError(err?.name === "NotAllowedError" ? "permissão de câmera negada" : (err?.message || "não consegui acessar a câmera"));
+        // o Modo Interativo NÃO morre por falta de câmera — a carinha e as falas espontâneas
+        // continuam, só o gesto de acordar deixa de funcionar. Já a Observância sem câmera não
+        // faz sentido nenhum, então essa sim se desliga.
+        setObservanceMode(false);
+      });
+    return () => {
+      cancelled = true;
+      observanceStreamRef.current?.getTracks().forEach((t) => t.stop());
+      observanceStreamRef.current = null;
+    };
+  }, [observanceMode, interactiveMode, cameraFacing]);
+
+  // Câmera de Vigia — câmera+microfone contínuos (ao contrário da Observância, que só tira UMA
+  // foto por pergunta). Independente da Observância: cada uma pode estar ligada sem a outra.
+  useEffect(() => {
+    if (!cameraVigiaMode) {
+      cameraVigiaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      cameraVigiaStreamRef.current = null;
+      return;
+    }
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setCameraVigiaError("este navegador não dá acesso à câmera");
+      setCameraVigiaMode(false);
+      return;
+    }
+    let cancelled = false;
+    setCameraVigiaError(null);
+    // width/height/frameRate explícitos foram testados e pareceram travar a captura numa webcam
+    // real (preview ficava preto mesmo com metadata OK) — voltou a pedir só o facingMode, sem
+    // forçar resolução. Se "fica bugando e não flui" voltar a acontecer, o ajuste de banda
+    // precisa vir de outro lugar (ex.: RTCRtpSender.setParameters, não da constraint de captura).
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: cameraFacing } }, audio: true })
+      .then((stream) => {
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        cameraVigiaStreamRef.current = stream;
+        addLog("[CÂMERA]", GR, `stream obtida: ${stream.getVideoTracks().length} vídeo, ${stream.getAudioTracks().length} áudio`);
+        if (cameraVigiaVideoRef.current) {
+          cameraVigiaVideoRef.current.srcObject = stream;
+          cameraVigiaVideoRef.current.play().catch((err) => addLog("[CÂMERA]", OR, `preview: play() falhou: ${err.message}`));
+        } else {
+          addLog("[CÂMERA]", OR, "preview: elemento de vídeo ainda não estava pronto");
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setCameraVigiaError(err?.name === "NotAllowedError" ? "permissão de câmera/microfone negada" : (err?.message || "não consegui acessar a câmera"));
+        setCameraVigiaMode(false);
+      });
+    return () => {
+      cancelled = true;
+      cameraVigiaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      cameraVigiaStreamRef.current = null;
+    };
+  }, [cameraVigiaMode, cameraFacing]);
+
+  // Câmera de Vigia: escuta pedidos de outros dispositivos querendo assistir (canal "camera")
+  // e mensagens de texto deles, que a Lisa lê em voz alta e mostra na tela por uns segundos.
+  useEffect(() => {
+    if (!cameraVigiaMode) return;
+    let cancelled = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 24; // ~6s de tolerância — câmera+microfone juntos podem demorar mais que a tela sozinha pra inicializar
+    const tryStart = () => {
+      if (cancelled) return;
+      const stream = cameraVigiaStreamRef.current;
+      if (!stream) {
+        if (attempts++ < MAX_ATTEMPTS) { setTimeout(tryStart, 250); return; }
+        addLog("[CÂMERA]", OR, "sem stream da câmera depois de várias tentativas — tente desligar e ligar de novo");
+        return;
+      }
+      screenShareCameraHostRef.current = hostScreenShare({
+        deviceId: getDeviceId(),
+        stream,
+        channel: "camera",
+        onLog: (msg) => addLog("[CÂMERA]", PU, msg),
+        onChatMessage: async (text) => {
+          addLog("[CÂMERA]", GR, `mensagem recebida: ${text}`);
+          // interpreta antes de falar (não repete palavra por palavra) — e fala pelo MESMO
+          // pipeline de voz das respostas normais (mesma voz configurada, nunca a de reserva
+          // do navegador, que foi o que causava "a voz varia").
+          let reply = text;
+          try {
+            const res = await fetch("/api/screen-share/interpret", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ text, personaMode: personaModeForScreenRef.current }),
+            });
+            const data = await res.json();
+            if (data?.ok && data.reply) reply = data.reply;
+          } catch {
+            // sem interpretação por algum motivo — ainda assim fala a mensagem crua, melhor
+            // que ficar em silêncio quando alguém mandou de propósito.
+          }
+          setCameraVigiaIncomingMsg(reply);
+          speakText(reply, { voiceName: voiceNameForScreenRef.current }).catch(() => {});
+          setTimeout(() => setCameraVigiaIncomingMsg((cur) => (cur === reply ? null : cur)), 12000);
+        },
+      });
+    };
+    const kickoff = setTimeout(tryStart, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(kickoff);
+      screenShareCameraHostRef.current?.stop();
+      screenShareCameraHostRef.current = null;
+    };
+    // cameraFacing nas dependências é de propósito, mesmo sem ser lido diretamente aqui: trocar
+    // de câmera cria um STREAM NOVO (o efeito de getUserMedia acima até PARA o antigo) — sem
+    // reiniciar a transmissão aqui, ela ficava presa mandando faixas já mortas do stream velho,
+    // e simplesmente parava de transmitir sem erro nenhum. Refazendo do zero (o retry acima já
+    // sonda até o stream novo ficar pronto), ela pega o stream certo depois da troca.
+  }, [cameraVigiaMode, cameraFacing, addLog]);
+
+  // tira a foto ATUAL da câmera (só no instante da pergunta, nunca antes) — reduzida pra no
+  // máx. 640px no lado maior, o bastante pra contar dedos/ver cor de roupa sem gastar token
+  // à toa com resolução alta que o Gemini nem precisa.
+  const captureObservanceFrame = useCallback(() => {
+    const v = observanceVideoRef.current;
+    if (!v || !v.videoWidth) return null;
+    const maxSide = 640;
+    const scale = Math.min(1, maxSide / Math.max(v.videoWidth, v.videoHeight));
+    const w = Math.round(v.videoWidth * scale), h = Math.round(v.videoHeight * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    canvas.getContext("2d").drawImage(v, 0, 0, w, h);
+    const base64 = canvas.toDataURL("image/jpeg", 0.82).split(",")[1];
+    return base64 ? { mimeType: "image/jpeg", data: base64 } : null;
+  }, []);
+
+  // ---- Gesto de acordar (✌️ V de vitória) — com o Modo Observância ligado, mostrar esse
+  // gesto pra câmera faz a Lisa perguntar "o que você precisa?" e já abrir o microfone
+  // sozinha, sem precisar tocar em nada — pensado pra quando você NEM está olhando pra tela.
+  // Usa @mediapipe/tasks-vision (reconhecimento de gestos pronto do Google, rodando local no
+  // navegador via WASM — os arquivos ficam em public/mediapipe/, sem depender de nenhum CDN
+  // externo em runtime) — não tenta reconhecer um gesto "customizado" (isso exigiria treinar
+  // um modelo do zero, caro e nada garantido); usa um dos gestos JÁ reconhecidos de fábrica.
+  const gestureRecognizerRef = useRef(null);
+  const lastGestureTriggerRef = useRef(0);
+  const GESTURE_COOLDOWN_MS = 4000; // evita disparar de novo enquanto ainda está segurando o gesto
+  const GESTURE_CONFIDENCE_MIN = 0.6;
+  // espelham estado que ainda não foi declarado neste ponto do arquivo (stopSpeaking/toggleMic
+  // vêm depois) — sem isso, o efeito abaixo teria que depender deles e recarregaria o
+  // reconhecedor de gestos (modelo de ~8MB) toda vez que qualquer coisa nem relacionada
+  // mudasse. As atribuições reais ficam perto de onde cada um é declarado, mais abaixo.
+  const stopSpeakingForGestureRef = useRef(null);
+  const toggleMicForGestureRef = useRef(null);
+  const listeningForGestureRef = useRef(listening);
+  listeningForGestureRef.current = listening;
+  const busyForGestureRef = useRef(busy);
+  busyForGestureRef.current = busy;
+
+  const triggerWake = useCallback(async () => {
+    addLog("[GESTO]", PU, "✌️ detectado — acordando");
+    stopSpeakingForGestureRef.current?.();
+    try {
+      await speakText("Oi! O que você precisa?", { voiceName: voiceNameForScreenRef.current });
+    } catch {
+      // segue e abre o mic mesmo se a fala falhar — o gesto não pode ficar "preso" por isso
+    }
+    toggleMicForGestureRef.current?.();
+  }, [addLog]);
+
+  useEffect(() => {
+    // vale pra Observância e pro Modo Interativo — nos dois o gesto ✌️ chama a Lisa
+    if (!observanceMode && !interactiveMode) {
+      gestureRecognizerRef.current?.close?.();
+      gestureRecognizerRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    let intervalId = null;
+    (async () => {
+      try {
+        const { GestureRecognizer, FilesetResolver } = await import("@mediapipe/tasks-vision");
+        const vision = await FilesetResolver.forVisionTasks("/mediapipe/wasm");
+        const recognizer = await GestureRecognizer.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: "/mediapipe/gesture_recognizer.task", delegate: "GPU" },
+          runningMode: "VIDEO",
+        });
+        if (cancelled) { recognizer.close(); return; }
+        gestureRecognizerRef.current = recognizer;
+        addLog("[GESTO]", GR, "reconhecimento pronto — mostra ✌️ pra câmera pra chamar a Lisa");
+
+        intervalId = setInterval(() => {
+          const v = observanceVideoRef.current;
+          const rec = gestureRecognizerRef.current;
+          if (!v || !rec || !v.videoWidth) return;
+          try {
+            const result = rec.recognizeForVideo(v, performance.now());
+            const top = result?.gestures?.[0]?.[0];
+            if (top?.categoryName === "Victory" && top.score >= GESTURE_CONFIDENCE_MIN) {
+              const now = Date.now();
+              if (
+                now - lastGestureTriggerRef.current > GESTURE_COOLDOWN_MS &&
+                !listeningForGestureRef.current &&
+                !busyForGestureRef.current &&
+                // com jogo aberto o gesto NÃO acorda: no pedra-papel-tesoura o ✌️ é a tesoura,
+                // e sem isso mostrar tesoura abriria o microfone no meio da partida. Nos outros
+                // jogos o motivo é o mesmo em espírito: ela não deve interromper o jogo.
+                !interactiveGameRef.current
+              ) {
+                lastGestureTriggerRef.current = now;
+                triggerWake();
+              }
+            }
+          } catch {
+            // detecção falhou num frame isolado — ignora, tenta de novo no próximo tick
+          }
+        }, 400);
+      } catch (err) {
+        if (!cancelled) addLog("[GESTO]", OR, `não consegui iniciar reconhecimento de gestos: ${err?.message || err}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (intervalId) clearInterval(intervalId);
+      gestureRecognizerRef.current?.close?.();
+      gestureRecognizerRef.current = null;
+    };
+  }, [observanceMode, interactiveMode, addLog, triggerWake]);
+
+  // ---- Modo Tela: a Lisa "vê" a tela do computador (getDisplayMedia) — DESKTOP-ONLY (o
+  // toggle só existe no branch desktop deste componente, "enquanto mexo no PC"), com 2
+  // modos que se somam:
+  //  - reativo: liga a captura, e cada pergunta manda um retrato ATUAL da tela junto (mesmo
+  //    mecanismo do Modo Observância — ver captureObservanceFrame acima).
+  //  - proativo (screenAutoComment): além disso, vigia sozinha num intervalo configurável
+  //    (screenIntervalMs) e só fala alguma coisa quando o Gemini decide que há algo
+  //    genuinamente digno de nota (ver /api/screen-comment) — na maioria das vezes fica
+  //    quieta. Um direcionamento livre (screenFocus) pode ser dado pra pautar o que ela
+  //    prioriza notar.
+  // O navegador SEMPRE pede permissão nativa (escolher tela/janela/aba) — isso não dá pra
+  // pular, é trava de segurança do próprio Chrome/Edge. Igual à câmera, sem localStorage de
+  // propósito (não fica ligado sozinho na próxima vez que abrir o app).
+  const SCREEN_INTERVAL_OPTIONS = [
+    { value: 5000, label: "5 segundos" },
+    { value: 15000, label: "15 segundos" },
+    { value: 30000, label: "30 segundos" },
+    { value: 60000, label: "1 minuto" },
+    { value: 120000, label: "2 minutos" },
+    { value: 300000, label: "5 minutos" },
+  ];
+  const [screenMode, setScreenMode] = useState(false);
+  const [screenAutoComment, setScreenAutoComment] = useState(false);
+  const [screenError, setScreenError] = useState(null);
+  const [screenIntervalMs, setScreenIntervalMs] = useState(30000); // com o pool de 35 chaves, intervalos curtos deixaram de ser um problema de cota
+  const [screenFocus, _setScreenFocus] = useState(""); // direcionamento livre: "preste atenção em X" — some no prompt da vigília
+  const screenFocusRef = useRef(""); // lido fresco a cada tick, sem reiniciar o intervalo a cada tecla digitada
+  screenFocusRef.current = screenFocus;
+  // Transmissão: com isso ligado (e Modo Tela ativo), este dispositivo fica "assistível" ao
+  // vivo por outro (WebRTC peer-to-peer, ver src/lib/screenShareRTC.js — o vídeo em si nunca
+  // passa pelo servidor, só a sinalização inicial). Independente de "Vigiar sozinha"/persistir
+  // observações — isso agora é automático (ver a vigília abaixo), não precisa de toggle.
+  // Nunca persiste sozinha (não é preferência durável) — reseta quando a tela para de ser
+  // compartilhada.
+  const [transmissionMode, setTransmissionMode] = useState(false);
+  const screenShareHostRef = useRef(null);
+  useEffect(() => { if (!screenMode) setTransmissionMode(false); }, [screenMode]);
+  const screenVideoRef = useRef(null);
+  const screenStreamRef = useRef(null);
+
+  // carrega intervalo/direcionamento salvos — preferências de fluxo de trabalho, não segredo
+  // nenhum, então (ao contrário do próprio toggle da câmera/tela) tudo bem persistir entre sessões
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const savedMs = Number(localStorage.getItem("screenIntervalMs"));
+    if (SCREEN_INTERVAL_OPTIONS.some((o) => o.value === savedMs)) setScreenIntervalMs(savedMs);
+    const savedFocus = localStorage.getItem("screenFocus");
+    if (savedFocus) _setScreenFocus(savedFocus);
+    const savedVigiaMs = Number(localStorage.getItem("vigiaAutoIntervalMs"));
+    if (SCREEN_INTERVAL_OPTIONS.some((o) => o.value === savedVigiaMs)) setVigiaAutoIntervalMs(savedVigiaMs);
+  }, []);
+
+  const chooseScreenInterval = useCallback((ms) => {
+    setScreenIntervalMs(ms);
+    if (typeof window !== "undefined") localStorage.setItem("screenIntervalMs", String(ms));
+  }, []);
+
+  const chooseVigiaAutoInterval = useCallback((ms) => {
+    setVigiaAutoIntervalMs(ms);
+    if (typeof window !== "undefined") localStorage.setItem("vigiaAutoIntervalMs", String(ms));
+  }, []);
+
+  const updateScreenFocus = useCallback((text) => {
+    _setScreenFocus(text);
+    if (typeof window !== "undefined") localStorage.setItem("screenFocus", text);
+  }, []);
+
+  useEffect(() => {
+    if (!screenMode) {
+      screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+      screenStreamRef.current = null;
+      setScreenAutoComment(false); // sem tela, comentário automático não tem o que analisar
+      setTransmissionMode(false);
+      return;
+    }
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getDisplayMedia) {
+      setScreenError("este navegador não suporta compartilhamento de tela");
+      setScreenMode(false);
+      return;
+    }
+    let cancelled = false;
+    setScreenError(null);
+    // taxa de quadros limitada de propósito (ver mesmo comentário na Câmera de Vigia) — tela
+    // compartilhada raramente precisa de mais que uns 15fps pra dar pra acompanhar de longe.
+    navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 15, max: 20 } }, audio: false })
+      .then((stream) => {
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        screenStreamRef.current = stream;
+        if (screenVideoRef.current) {
+          screenVideoRef.current.srcObject = stream;
+          screenVideoRef.current.play().catch(() => {});
+        }
+        // se a pessoa parar o compartilhamento pelo controle nativo do navegador (barra
+        // "parar de compartilhar"), desliga o modo aqui também — senão o app acha que ainda tem tela
+        const [track] = stream.getVideoTracks();
+        track?.addEventListener("ended", () => setScreenMode(false));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setScreenError(err?.name === "NotAllowedError" ? "permissão de compartilhamento de tela negada" : (err?.message || "não consegui iniciar o compartilhamento de tela"));
+        setScreenMode(false);
+      });
+    return () => {
+      cancelled = true;
+      screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+      screenStreamRef.current = null;
+    };
+  }, [screenMode]);
+
+  // Transmissão: enquanto ligada (e a tela realmente sendo compartilhada), este dispositivo
+  // vira "host" — escuta pedidos de outros dispositivos querendo assistir (ver
+  // src/lib/screenShareRTC.js) e abre uma conexão WebRTC por espectador. Tenta várias vezes (não
+  // só uma vez após 1s) até o <video> do compartilhamento realmente ter um stream pronto — visto
+  // na prática (câmera de vigia) que um prazo fixo curto às vezes não é suficiente.
+  useEffect(() => {
+    if (!transmissionMode || !screenMode) return;
+    let cancelled = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 24;
+    const tryStart = () => {
+      if (cancelled) return;
+      const stream = screenStreamRef.current;
+      if (!stream) {
+        if (attempts++ < MAX_ATTEMPTS) { setTimeout(tryStart, 250); return; }
+        addLog("[TRANSMISSÃO]", OR, "sem stream da tela depois de várias tentativas — tente desligar e ligar de novo");
+        return;
+      }
+      screenShareHostRef.current = hostScreenShare({
+        deviceId: getDeviceId(),
+        stream,
+        onLog: (msg) => addLog("[TRANSMISSÃO]", PU, msg),
+      });
+    };
+    const kickoff = setTimeout(tryStart, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(kickoff);
+      screenShareHostRef.current?.stop();
+      screenShareHostRef.current = null;
+    };
+  }, [transmissionMode, screenMode, addLog]);
+
+  // retrato ATUAL da tela — maior que a foto da câmera (1280px) porque precisa dar pra ler
+  // texto/UI pequena, não só reconhecer forma/cor.
+  const captureScreenFrame = useCallback(() => {
+    const v = screenVideoRef.current;
+    if (!v || !v.videoWidth) return null;
+    const maxSide = 1280;
+    const scale = Math.min(1, maxSide / Math.max(v.videoWidth, v.videoHeight));
+    const w = Math.round(v.videoWidth * scale), h = Math.round(v.videoHeight * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    canvas.getContext("2d").drawImage(v, 0, 0, w, h);
+    const base64 = canvas.toDataURL("image/jpeg", 0.85).split(",")[1];
+    return base64 ? { mimeType: "image/jpeg", data: base64 } : null;
+  }, []);
+
+  // espelham o valor mais recente em ref — de propósito NÃO entram nas deps do efeito de
+  // vigília abaixo, senão ligar/desligar a voz no meio da sessão reiniciaria a vigília
+  // (e dispararia uma checagem extra na hora, gastando cota à toa por causa de um toggle
+  // que não tem nada a ver com o Modo Tela).
+  const personaModeForScreenRef = useRef(personaMode);
+  personaModeForScreenRef.current = personaMode;
+  const voiceOnForScreenRef = useRef(voiceOn);
+  voiceOnForScreenRef.current = voiceOn;
+  const voiceNameForScreenRef = useRef(voiceName);
+  voiceNameForScreenRef.current = voiceName;
+
+  // true enquanto QUALQUER vigília (Modo Tela OU Observância) estiver FALANDO um comentário ou
+  // esperando a janela de resposta dele — compartilhado entre as duas. Sem isso, um tick novo
+  // podia disparar (setInterval não espera o anterior terminar) enquanto o de antes ainda
+  // estava no meio de falar/ouvir a resposta, e as duas falas saíam JUNTAS, uma por cima da
+  // outra (foi exatamente isso que aconteceu: a réplica pro usuário e um comentário novo da
+  // vigília saindo ao mesmo tempo).
+  const proactiveTurnRef = useRef(false);
+
+  // `ask` só é declarada bem mais abaixo no componente, mas os efeitos de vigília (Modo Tela/
+  // Observância) — declarados aqui em cima — precisam poder chamá-la depois de um comentário.
+  // Mesmo truque já usado em toggleMicForGestureRef: um ref populado com a função de verdade
+  // assim que ela existir (linha mais abaixo), lido só na hora de USAR (dentro de um timer/
+  // callback assíncrono), nunca durante a montagem — por isso não quebra por ordem de declaração.
+  const askRef = useRef(null);
+
+  // Réplica do Modo Escuta: abre uma janela curta de reconhecimento de fala do navegador logo
+  // depois de um comentário falado — dá pra responder ou pedir algo sem apertar o microfone na
+  // mão. Resolve com o texto ouvido (ou "" se não ouviu nada dentro do tempo). Instância PRÓPRIA
+  // de reconhecimento, separada da do botão de microfone manual (toggleMic, mais abaixo) — não
+  // mexe no estado `listening` nem atrapalha se o usuário estiver segurando o mic por conta própria.
+  const listenForReply = useCallback((timeoutMs = 6000) => {
+    return new Promise((resolve) => {
+      if (typeof window === "undefined") { resolve(""); return; }
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SR) { resolve(""); return; }
+      let finalText = "";
+      let settled = false;
+      const rec = new SR();
+      rec.lang = "pt-BR";
+      rec.interimResults = false;
+      rec.continuous = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(hardStop);
+        resolve(finalText.trim());
+      };
+      rec.onresult = (e) => {
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
+        }
+      };
+      rec.onerror = finish;
+      rec.onend = finish;
+      const hardStop = setTimeout(() => { try { rec.stop(); } catch {} }, timeoutMs);
+      try { rec.start(); } catch { resolve(""); }
+    });
+  }, []);
+
+  // espelham busy/listening em ref — openReplyWindow precisa ler o valor MAIS RECENTE na hora
+  // de chamar (dentro de um timer da vigília), não o que existia quando o efeito foi montado.
+  const busyForWatchRef = useRef(busy);
+  busyForWatchRef.current = busy;
+  const listeningForWatchRef = useRef(listening);
+  listeningForWatchRef.current = listening;
+
+  // depois de um comentário FALADO (Modo Tela/Observância) — ou da PRÓPRIA resposta dela numa
+  // réplica anterior — abre a janela de resposta (só se o Modo Escuta estiver ligado, e só se
+  // ninguém já estiver com o mic manual na mão ou uma pergunta em andamento). Se a pessoa
+  // disser algo, vira uma pergunta normal (com o que foi dito antes como contexto, pra "fala
+  // mais sobre isso" fazer sentido) e, depois dela terminar de responder, abre OUTRA janela —
+  // continua o vaivém sozinha enquanto o usuário continuar respondendo, até `MAX_REPLY_TURNS`
+  // (trava de segurança — não deixa ficar escutando pra sempre se algo nunca ficar em
+  // silêncio de verdade) ou até a pessoa ficar quieta (aí volta a ser só a vigília normal).
+  const MAX_REPLY_TURNS = 6;
+  const openReplyWindow = useCallback(async (comment, logPrefix, turn = 1) => {
+    if (conversaAbertaRef.current) return; // o Modo conversa já está ouvindo
+    if (!micWatchMode || listeningForWatchRef.current || busyForWatchRef.current) return;
+    if (turn > MAX_REPLY_TURNS) { addLog(logPrefix, CY, "várias idas e voltas seguidas — parando a escuta automática por aqui (pode continuar na mão, segurando o microfone)."); return; }
+
+    playListenBeep();
+    setAutoListening(true);
+    setMode("autolisten");
+    addLog(logPrefix, CY, "🎙️ pode falar…");
+    const transcript = await listenForReply(6000);
+    setAutoListening(false);
+
+    if (!transcript) {
+      addLog(logPrefix, CY, "nada ouvido — seguindo.");
+      setMode("idle");
+      return;
+    }
+    addLog(logPrefix, GR, `→ "${transcript}"`);
+    await askRef.current?.(`(Contexto: você, a Lisa, acabou de comentar: "${comment}") ${transcript}`, { displayText: transcript });
+
+    // espera a resposta terminar de ser falada antes de abrir a PRÓXIMA janela — senão elas
+    // se atropelam (mesmo motivo do proactiveTurnRef nas vigílias).
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      const aindaFalando = !!audioRef.current || isBrowserVoiceAudioPlaying() || (typeof window !== "undefined" && window.speechSynthesis?.speaking);
+      if (!aindaFalando) break;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    openReplyWindow(answerRef.current || transcript, logPrefix, turn + 1);
+  }, [micWatchMode, addLog, listenForReply]);
+
+  // vigília proativa: dispara já na hora de ligar (pra dar sinal de vida imediato, em vez de
+  // ficar quieta os primeiros 4 min sem dar pra saber se está funcionando) e depois em
+  // intervalos espaçados — SÓ fala quando /api/screen-comment devolve um comentário de
+  // verdade; toda tentativa (com ou sem comentário, com ou sem erro) fica registrada no
+  // log — sem isso, "nada digno de nota" e "falhou por cota" pareciam a mesma coisa: silêncio.
+  // Usa a voz do NAVEGADOR (não a do Gemini) de propósito, igual ao NotificationToasts: evita
+  // gastar cota de TTS extra numa fala que ninguém pediu, e não mexe na fila/geração de fala
+  // da conversa principal (não interrompe uma resposta em andamento).
+  useEffect(() => {
+    if (!screenMode || !screenAutoComment) return;
+    let cancelled = false;
+    const tick = async () => {
+      const frame = captureScreenFrame();
+      if (!frame) { addLog("[TELA]", OR, "vigília: sem retrato da tela ainda (compartilhamento iniciando?)"); return; }
+      try {
+        const res = await fetch("/api/screen-comment", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ image: frame, personaMode: personaModeForScreenRef.current, focus: screenFocusRef.current || null, persist: true }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!data?.ok) { addLog("[TELA]", OR, `vigília falhou: ${data?.error || `HTTP ${res.status}`}`); return; }
+        if (!data.comment) { addLog("[TELA]", CY, "vigília: nada digno de nota agora"); return; }
+        addLog("[TELA]", PU, data.comment);
+        setMessages((m) => [...m, { id: `screen${Date.now()}`, role: "assistant", text: data.comment }]); lembrarDaLisa(data.comment);
+        // tenta a voz do Gemini primeiro (com fallback automático pro navegador se falhar) —
+        // antes era só navegador de propósito, pra poupar cota; agora que tem uma chave
+        // prioritária com faturamento e folga de sobra, vale usar a voz de verdade aqui também.
+        // Mas só fala se a Lisa NÃO estiver falando nada agora (resposta em andamento, ou
+        // acabou de acordar com o gesto) — comentário passivo da vigília nunca deve entrar
+        // por cima de uma fala explícita; o texto ainda aparece no chat/log de qualquer jeito.
+        const jaFalando = !!audioRef.current || isBrowserVoiceAudioPlaying() || proactiveTurnRef.current || (typeof window !== "undefined" && window.speechSynthesis?.speaking);
+        if (jaFalando) addLog("[TELA]", CY, "vigília: comentário achado, mas a Lisa já está falando — só no texto desta vez");
+        else if (voiceOnForScreenRef.current) {
+          proactiveTurnRef.current = true;
+          try {
+            await speakText(data.comment, { voiceName: voiceNameForScreenRef.current }).catch(() => {});
+            if (!cancelled) await openReplyWindow(data.comment, "[TELA]");
+          } finally {
+            proactiveTurnRef.current = false;
+          }
+        }
+      } catch (err) {
+        if (!cancelled) addLog("[TELA]", OR, `vigília falhou: ${err?.message || err}`);
+      }
+    };
+    // pequeno atraso na 1ª chamada — dá tempo do <video> do compartilhamento (outro efeito,
+    // ligado por screenMode) realmente começar a produzir frames antes da 1ª tentativa
+    const kickoff = setTimeout(tick, 1000);
+    const id = setInterval(tick, screenIntervalMs);
+    return () => { cancelled = true; clearTimeout(kickoff); clearInterval(id); };
+  }, [screenMode, screenAutoComment, screenIntervalMs, captureScreenFrame, addLog, openReplyWindow]);
+
+  // Modo Vigia PROATIVO: ao contrário da vigília do Modo Tela acima, esta NÃO depende de
+  // screenMode/captureScreenFrame — só lê a tabela screen_observations na nuvem (ver
+  // src/lib/screenWatch.js), então funciona de QUALQUER dispositivo (ex.: liga no celular
+  // enquanto o Modo Tela + Transmissão rodam no computador). Ao ligar, primeiro só marca o
+  // ponteiro atual (sinceId=0 devolve o id mais recente sem narrar) — sem isso, a 1ª checagem
+  // narraria de uma vez todo o histórico que já existia antes de ligar.
+  useEffect(() => {
+    if (!vigiaAutoOn) return;
+    let cancelled = false;
+    vigiaLastIdRef.current = 0;
+    const tick = async () => {
+      try {
+        const res = await fetch("/api/screen-watch/digest", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sinceId: vigiaLastIdRef.current, personaMode: personaModeForScreenRef.current }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!data?.ok) { addLog("[VIGIA]", OR, `narração falhou: ${data?.error || `HTTP ${res.status}`}`); return; }
+        if (typeof data.latestId === "number") vigiaLastIdRef.current = data.latestId;
+        if (!data.comment) { addLog("[VIGIA]", CY, "nada novo digno de nota agora"); return; }
+        addLog("[VIGIA]", PU, data.comment);
+        setMessages((m) => [...m, { id: `vigia${Date.now()}`, role: "assistant", text: data.comment }]); lembrarDaLisa(data.comment);
+        const jaFalando = !!audioRef.current || isBrowserVoiceAudioPlaying() || proactiveTurnRef.current || (typeof window !== "undefined" && window.speechSynthesis?.speaking);
+        if (jaFalando) addLog("[VIGIA]", CY, "narração achada, mas a Lisa já está falando — só no texto desta vez");
+        else if (voiceOnForScreenRef.current) {
+          proactiveTurnRef.current = true;
+          try {
+            await speakText(data.comment, { voiceName: voiceNameForScreenRef.current }).catch(() => {});
+            if (!cancelled) await openReplyWindow(data.comment, "[VIGIA]");
+          } finally {
+            proactiveTurnRef.current = false;
+          }
+        }
+      } catch (err) {
+        if (!cancelled) addLog("[VIGIA]", OR, `narração falhou: ${err?.message || err}`);
+      }
+    };
+    const kickoff = setTimeout(tick, 1000);
+    const id = setInterval(tick, vigiaAutoIntervalMs);
+    return () => { cancelled = true; clearTimeout(kickoff); clearInterval(id); };
+  }, [vigiaAutoOn, vigiaAutoIntervalMs, addLog, openReplyWindow]);
+
+  // ---- Modo Observância (proativo): saudação pré-configurada — enquanto a câmera estiver
+  // ligada, a Lisa "de olho" sozinha (nenhuma pergunta precisa ser feita); se aparecer alguém
+  // que mora com o usuário (configurado em LISA_CASA), cumprimenta e puxa papo
+  // sozinha (ver instrucaoDaCamera em src/lib/gemini.js). Mesmo
+  // padrão da vigília do Modo Tela acima — dispara logo ao ligar, depois em intervalos
+  // espaçados, só fala quando /api/camera-comment devolver um comentário de verdade. Ao
+  // contrário do Modo Tela, não tem toggle separado de "auto" — o usuário pediu que rode
+  // sempre que a Observância estiver ligada.
+  useEffect(() => {
+    if (!observanceMode) return;
+    let cancelled = false;
+    const tick = async () => {
+      const frame = captureObservanceFrame();
+      if (!frame) { addLog("[OBS]", OR, "saudação: sem retrato da câmera ainda"); return; }
+      try {
+        const res = await fetch("/api/camera-comment", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ image: frame, personaMode: personaModeForScreenRef.current }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!data?.ok) { addLog("[OBS]", OR, `saudação falhou: ${data?.error || `HTTP ${res.status}`}`); return; }
+        if (!data.comment) { addLog("[OBS]", CY, "saudação: nada digno de nota agora"); return; }
+        addLog("[OBS]", PU, data.comment);
+        setMessages((m) => [...m, { id: `obsgreet${Date.now()}`, role: "assistant", text: data.comment }]); lembrarDaLisa(data.comment);
+        // mesma regra de prioridade de voz da vigília do Modo Tela — nunca fala por cima de
+        // uma fala já em andamento (resposta normal, ou saudação do gesto de acordar).
+        const jaFalando = !!audioRef.current || isBrowserVoiceAudioPlaying() || proactiveTurnRef.current || (typeof window !== "undefined" && window.speechSynthesis?.speaking);
+        if (jaFalando) addLog("[OBS]", CY, "saudação: comentário achado, mas a Lisa já está falando — só no texto desta vez");
+        else if (voiceOnForScreenRef.current) {
+          proactiveTurnRef.current = true;
+          try {
+            await speakText(data.comment, { voiceName: voiceNameForScreenRef.current }).catch(() => {});
+            if (!cancelled) await openReplyWindow(data.comment, "[OBS]");
+          } finally {
+            proactiveTurnRef.current = false;
+          }
+        }
+      } catch (err) {
+        if (!cancelled) addLog("[OBS]", OR, `saudação falhou: ${err?.message || err}`);
+      }
+    };
+    const kickoff = setTimeout(tick, 1500);
+    const id = setInterval(tick, 30000); // sem seletor de intervalo (diferente do Modo Tela) — 30s é um meio-termo entre responsivo e não gastar cota à toa
+    return () => { cancelled = true; clearTimeout(kickoff); clearInterval(id); };
+  }, [observanceMode, captureObservanceFrame, addLog, openReplyWindow]);
+
+  // abre o microfone só enquanto o Modo Escuta estiver ligado E (Modo Tela OU Observância)
+  // também estiver — desligando qualquer um dos dois, o mic fecha de verdade (para de captar
+  // som), não fica "pausado" escondido.
+  useEffect(() => {
+    if (!micWatchMode || !(screenMode || observanceMode)) {
+      micWatchStreamRef.current?.getTracks().forEach((t) => t.stop());
+      micWatchStreamRef.current = null;
+      return;
+    }
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setMicWatchError("este navegador não dá acesso ao microfone");
+      setMicWatchMode(false);
+      return;
+    }
+    let cancelled = false;
+    setMicWatchError(null);
+    // desliga o processamento de ÁUDIO DE CHAMADA (cancelamento de eco, supressão de ruído,
+    // ganho automático) — esses três vêm LIGADOS por padrão, otimizados pra voz falada numa
+    // ligação, e comprimem/cortam justamente o tipo de som sustentado que canto tem (nota
+    // seca, vibrato, dinâmica) — sem desligar, a Lisa acaba ouvindo uma versão "achatada" do
+    // que você realmente cantou.
+    navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      video: false,
+    })
+      .then((stream) => {
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        micWatchStreamRef.current = stream;
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setMicWatchError(err?.name === "NotAllowedError" ? "permissão de microfone negada" : (err?.message || "não consegui acessar o microfone"));
+        setMicWatchMode(false);
+      });
+    return () => {
+      cancelled = true;
+      micWatchStreamRef.current?.getTracks().forEach((t) => t.stop());
+      micWatchStreamRef.current = null;
+    };
+  }, [micWatchMode, screenMode, observanceMode]);
+
+  // grava UM pedaço de áudio (duração fixa) do stream já aberto, e devolve já em WAV+base64 —
+  // o MediaRecorder só sabe gravar em formato comprimido (webm/opus na maioria dos
+  // navegadores), então decodifica com o Web Audio API e reescreve como PCM16/WAV na mão
+  // (formato garantido aceito pelo Gemini; testado direto contra a API antes de usar aqui).
+  //
+  // `getUserMedia` é assíncrono — o efeito que ABRE o microfone e o efeito que já começa o
+  // laço de gravação disparam no MESMO ciclo de render, então a 1ª chamada quase sempre
+  // chegava aqui ANTES do stream estar pronto ("microfone não está aberto" mesmo com a
+  // permissão já concedida). Espera um pouco pelo stream em vez de falhar na hora.
+  const recordMicChunk = useCallback((durationMs) => {
+    return new Promise(async (resolve, reject) => {
+      let stream = micWatchStreamRef.current;
+      for (let waited = 0; !stream && waited < 5000; waited += 200) {
+        await new Promise((r) => setTimeout(r, 200));
+        stream = micWatchStreamRef.current;
+      }
+      if (!stream) { reject(new Error("microfone não está aberto")); return; }
+      const chunks = [];
+      let recorder;
+      try {
+        recorder = new MediaRecorder(stream);
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onerror = (e) => reject(e.error || new Error("falha ao gravar áudio"));
+      recorder.onstop = async () => {
+        try {
+          const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+          const arrayBuffer = await blob.arrayBuffer();
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          const ctx = new AudioCtx();
+          const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+          const wav = encodeWavPCM16(audioBuffer);
+          ctx.close();
+          resolve({ mimeType: "audio/wav", data: arrayBufferToBase64(wav) });
+        } catch (err) {
+          reject(err);
+        }
+      };
+      recorder.start();
+      setTimeout(() => { if (recorder.state !== "inactive") recorder.stop(); }, durationMs);
+    });
+  }, []);
+
+  // ---- Modo Escuta (proativo): microfone realmente aberto, gravando pedacinhos curtos em
+  // sequência (grava → manda analisar → grava o próximo, sem sobrepor) enquanto o Modo Tela
+  // OU a Observância estiverem ligados — nunca sozinho. Mesma convenção de silêncio (NADA) e
+  // prioridade de voz das vigílias acima; ao contrário delas (setInterval de cadência fixa),
+  // aqui é um laço que se agenda sozinho, porque cada "captura" já TOMA um tempo pra gravar
+  // (não é instantâneo como printar a tela) — não faz sentido ter um intervalo fixo por cima.
+  const MIC_CHUNK_MS = 10000;
+  useEffect(() => {
+    if (!micWatchMode || !(screenMode || observanceMode)) return;
+    let cancelled = false;
+    const loop = async () => {
+      while (!cancelled) {
+        let clip;
+        try {
+          clip = await recordMicChunk(MIC_CHUNK_MS);
+        } catch (err) {
+          if (cancelled) break;
+          addLog("[MIC]", OR, `escuta: não consegui gravar (${err?.message || err})`);
+          await new Promise((r) => setTimeout(r, 4000));
+          continue;
+        }
+        if (cancelled) break;
+        try {
+          const res = await fetch("/api/mic-comment", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ audio: clip, personaMode: personaModeForScreenRef.current }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (cancelled) break;
+          if (!data?.ok) { addLog("[MIC]", OR, `escuta falhou: ${data?.error || `HTTP ${res.status}`}`); continue; }
+          if (!data.comment) { addLog("[MIC]", CY, "escuta: nada digno de nota agora"); continue; }
+          addLog("[MIC]", PU, data.comment);
+          setMessages((m) => [...m, { id: `mic${Date.now()}`, role: "assistant", text: data.comment }]); lembrarDaLisa(data.comment);
+          const jaFalando = !!audioRef.current || isBrowserVoiceAudioPlaying() || (typeof window !== "undefined" && window.speechSynthesis?.speaking);
+          if (jaFalando) addLog("[MIC]", CY, "escuta: comentário achado, mas a Lisa já está falando — só no texto desta vez");
+          else if (voiceOnForScreenRef.current) speakText(data.comment, { voiceName: voiceNameForScreenRef.current }).catch(() => {});
+        } catch (err) {
+          if (!cancelled) addLog("[MIC]", OR, `escuta falhou: ${err?.message || err}`);
+        }
+      }
+    };
+    loop();
+    return () => { cancelled = true; };
+  }, [micWatchMode, screenMode, observanceMode, recordMicChunk, addLog]);
+
+  // carrega a Visão do avatar escolhida antes — cada navegador guarda a sua (ver nota acima:
+  // só tem efeito no desktop, mas não custa nada carregar a preferência sempre)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const saved = localStorage.getItem("avatarView");
+    if (saved === "3d" || saved === "traditional" || saved === "esfera") setAvatarView(saved);
+    const savedSkin = localStorage.getItem("avatarSkin");
+    if (savedSkin === "cyborg" || savedSkin === "rigado") setAvatarSkin(savedSkin);
+  }, []);
+
+  // o usuário do MVP não tem Ondas nem Avatar 3D (01/11/2026: "os únicos disponíveis devem ser o
+  // rosto e, de padrão, a esfera de pontos — nada de avatar 3D")
+  useEffect(() => {
+    if (usuario && avatarView !== "esfera") setAvatarView("esfera");
+  }, [usuario, avatarView]);
+
+  const chooseAvatarView = useCallback((view) => {
+    setAvatarView(view);
+    if (typeof window !== "undefined") localStorage.setItem("avatarView", view);
+  }, []);
+
+  const chooseAvatarSkin = useCallback((skin) => {
+    setAvatarSkin(skin);
+    if (typeof window !== "undefined") localStorage.setItem("avatarSkin", skin);
+  }, []);
+
+  // lista de projetos do Sentinela pro seletor manual (mesma fonte que a aba Sentinela usa)
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/sentinel/projects")
+      .then((r) => r.json())
+      .then((d) => { if (alive && d.ok) setSentinelProjects(d.projects || []); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
+  // lista de repositórios conhecidos pro seletor manual do escopo "Código"
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/code-repos")
+      .then((r) => r.json())
+      .then((d) => { if (alive && d.ok) setCodeRepos(d.repos || []); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
+  // arquivos já indexados do repositório escolhido — refaz sempre que o repositório muda;
+  // "all" (todos os repositórios) não tem lista de arquivo nenhuma (não dá pra ler "um
+  // arquivo" sem saber de qual repo).
+  useEffect(() => {
+    setCodeFile(""); // troca de repositório invalida o arquivo escolhido antes
+    if (codeRepo === "all") { setCodeFiles([]); return; }
+    let alive = true;
+    fetch(`/api/code-repos/files?repo=${encodeURIComponent(codeRepo)}`)
+      .then((r) => r.json())
+      .then((d) => { if (alive && d.ok) setCodeFiles(d.files || []); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [codeRepo]);
+
+  // mobile: sem Topbar (ver Shell.js), então tema/auto-sync precisam de carregamento próprio aqui
+  useEffect(() => {
+    if (!isMobile || typeof window === "undefined") return;
+    try {
+      const saved = JSON.parse(localStorage.getItem("accentTheme") || "null");
+      if (saved?.name) setAccentName(saved.name);
+    } catch {}
+  }, [isMobile]);
+
+  useEffect(() => {
+    if (!isMobile) return;
+    let alive = true;
+    const check = () => fetch("/api/sync-status").then((r) => r.json()).then((s) => { if (alive) setAutoSync(s); }).catch(() => {});
+    check();
+    const id = setInterval(check, 30000);
+    return () => { alive = false; clearInterval(id); };
+  }, [isMobile]);
+
+  const chooseAccent = useCallback((theme) => {
+    applyAccentTheme(theme);
+    setAccentName(theme.name);
+    if (typeof window !== "undefined") localStorage.setItem("accentTheme", JSON.stringify(theme));
+  }, []);
+
+  const manualSync = useCallback(async () => {
+    if (ingesting) return;
+    setIngesting(true);
+    await runFullSync({
+      onProgress: (ev) => {
+        if (ev.type === "error") addLog("[INGEST]", OR, `✗ ${ev.label}: ${ev.message}`);
+        else if (ev.type === "finished") addLog("[INGEST]", CY, `finalizado · ${ev.grandTotal} chunks indexados`);
+      },
+    });
+    setIngesting(false);
+  }, [ingesting, addLog]);
+
+  // pré-carrega vozes do TTS de reserva (navegador) e verifica suporte a microfone
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (window.speechSynthesis) {
+      window.speechSynthesis.getVoices();
+      window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+    }
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) setVoiceSupported(false);
+  }, []);
+
+  // canvas visualizer (porta do mockup)
+  useEffect(() => {
+    const cv = canvasRef.current;
+    if (!cv) return;
+    const ctx = cv.getContext("2d");
+    let cw = 0, ch = 0, raf = 0, phase = 0;
+    const NB = 96;
+
+    const resize = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const r = cv.getBoundingClientRect();
+      cv.width = Math.max(1, r.width * dpr);
+      cv.height = Math.max(1, r.height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      cw = r.width; ch = r.height;
+    };
+    resize();
+    const ro = new ResizeObserver(resize);
+    ro.observe(cv);
+
+    const draw = () => {
+      const w = cw, h = ch, cx = w / 2, cy = h / 2;
+      const base = Math.min(w, h) * 0.26;
+      ctx.clearRect(0, 0, w, h);
+      const m = modeRef.current;
+      const now = performance.now() / 1000;
+
+      // Canvas não entende var(--accent-rgb)/var(--accent-hex) (isso só funciona em CSS/DOM) —
+      // por isso lê o valor JÁ resolvido da variável a cada frame, pra acompanhar o tema
+      // escolhido no seletor sem travar numa cor fixa.
+      const rootStyle = getComputedStyle(document.documentElement);
+      const accentRgb = rootStyle.getPropertyValue("--accent-rgb").trim() || "56, 225, 255";
+      const accentHex = rootStyle.getPropertyValue("--accent-hex").trim() || "#38e1ff";
+
+      let amp, speed, coreGlow;
+      if (m === "idle") { amp = 0.1; speed = 0.6; coreGlow = 0.5 + 0.2 * Math.sin(now * 1.6); }
+      else if (m === "listening") { amp = 0.42; speed = 2.2; coreGlow = 0.75 + 0.2 * Math.sin(now * 6); }
+      else { amp = 0.72; speed = 3.6; coreGlow = 0.9; }
+      phase += 0.016 * speed;
+
+      for (let i = 0; i < NB; i++) {
+        const ang = (i / NB) * Math.PI * 2;
+        const seed = i * 0.35;
+        let mag = Math.sin(seed * 1.3 + phase * 2.1) * 0.5
+                + Math.sin(seed * 2.7 - phase * 1.4) * 0.3
+                + Math.sin(seed * 0.7 + phase * 3.3) * 0.2;
+        mag = (mag + 1) / 2;
+        if (m === "idle") mag = 0.15 + mag * 0.12;
+        const len = base * (0.14 + mag * amp);
+        const x1 = cx + Math.cos(ang) * base, y1 = cy + Math.sin(ang) * base;
+        const x2 = cx + Math.cos(ang) * (base + len), y2 = cy + Math.sin(ang) * (base + len);
+        const g = ctx.createLinearGradient(x1, y1, x2, y2);
+        g.addColorStop(0, `rgba(${accentRgb},0.85)`);
+        g.addColorStop(1, mag > 0.7 ? "rgba(255,157,61,0.95)" : `rgba(${accentRgb},0.15)`);
+        ctx.strokeStyle = g; ctx.lineWidth = 2.2; ctx.lineCap = "round";
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+      }
+
+      const gr = ctx.createRadialGradient(cx, cy, 0, cx, cy, base * 0.95);
+      gr.addColorStop(0, `rgba(${accentRgb},${0.3 * coreGlow})`);
+      gr.addColorStop(0.5, `rgba(${accentRgb},${0.1 * coreGlow})`);
+      gr.addColorStop(1, `rgba(${accentRgb},0)`);
+      ctx.fillStyle = gr;
+      ctx.beginPath(); ctx.arc(cx, cy, base * 0.95, 0, Math.PI * 2); ctx.fill();
+
+      ctx.strokeStyle = `rgba(${accentRgb},${0.55 + coreGlow * 0.4})`;
+      ctx.lineWidth = 1.6; ctx.shadowBlur = 18; ctx.shadowColor = accentHex;
+      ctx.beginPath(); ctx.arc(cx, cy, base * 0.7, 0, Math.PI * 2); ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      if (m !== "idle") {
+        const rings = m === "speaking" ? 3 : 2;
+        for (let k = 0; k < rings; k++) {
+          const prog = ((now * (m === "speaking" ? 1.1 : 0.7) + k / rings) % 1);
+          const rr = base * (0.7 + prog * 1.5);
+          ctx.strokeStyle = `rgba(${accentRgb},${(1 - prog) * 0.35})`;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI * 2); ctx.stroke();
+        }
+      }
+
+      ctx.strokeStyle = `rgba(${accentRgb},0.25)`; ctx.lineWidth = 1;
+      for (let i = 0; i < 60; i++) {
+        const a = (i / 60) * Math.PI * 2 + now * 0.05;
+        const r0 = base * 1.55, r1 = base * (i % 5 === 0 ? 1.66 : 1.6);
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
+        ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+        ctx.stroke();
+      }
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => { cancelAnimationFrame(raf); ro.disconnect(); };
+  }, [avatarView, isMobile, mobileView]);
+
+  // ---- TTS em 2 pedaços: voz do Gemini, com voz do navegador como reserva (nunca alterna no meio) ----
+
+  const stopSpeaking = useCallback(() => {
+    // PARAR é parar a fala inteira (07/11/2026): os pedaços seguintes desta resposta — e, com a
+    // fala ao vivo, as frases que ainda vão chegar — não tocam mais. Antes, só o pedaço que estava
+    // tocando parava e o seguinte da fila começava (só a interrupção por "Lisa" fazia isto).
+    speechGenRef.current++;
+    if (typeof window !== "undefined" && window.speechSynthesis) window.speechSynthesis.cancel();
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+    if (currentAudioResolveRef.current) {
+      const resolve = currentAudioResolveRef.current;
+      currentAudioResolveRef.current = null;
+      resolve(); // libera a fila de reprodução, que senão ficaria travada esperando o onended
+    }
+    // corta TAMBÉM qualquer áudio tocado via speakText() (vigília do Modo Tela, saudação do
+    // gesto) — esse pipeline usa um <audio> próprio, fora do audioRef acima. Sem isto, "parar"
+    // só cortava o pipeline principal e a vigília/gesto continuavam falando por cima.
+    stopBrowserVoiceAudio();
+  }, []);
+  stopSpeakingForGestureRef.current = stopSpeaking;
+
+  // Teto de espera pela voz do Gemini — rede de segurança pra uma chamada travada, NÃO uma
+  // tentativa de "acelerar" a resposta. Já errei pra menos três vezes: 3,2s matava toda
+  // chamada; 9s cortava o servidor no meio das próprias tentativas dele; 20s derrubava
+  // respostas que iam dar certo.
+  //
+  // Os 45s vieram depois, calibrados por um motivo que NÃO VALE MAIS: "a Vercel corta a
+  // função em 60s, então esperar mais é inútil". A Lisa saiu da Vercel; o Worker não tem
+  // esse corte. Medido em produção depois da mudança, em dez amostras: 4, 4, 5, 13, 27, 28,
+  // 39, 58, 69 e 112 segundos — duas de seis passavam de 45s e caíam pra voz do navegador.
+  //
+  // O número abaixo NÃO é escolhido por gosto: ele cobre o pior caso do servidor. As três
+  // tentativas agora SE SOBREPÕEM (ver TTS_HEDGE_MS em src/lib/gemini.js) — a última começa
+  // aos 32s e morre no teto aos 58s. Os 70s aqui dão a margem de rede.
+  //
+  // Baixou de 85s justamente por causa do hedge: se as três já morreram aos 58s, esperar mais
+  // vinte e sete segundos não salva nenhuma chamada e só atrasa a voz de reserva.
+  //
+  // Mexer num sem mexer no outro reabre exatamente o problema que isto resolve: o navegador
+  // desistindo antes de o servidor terminar de tentar. `npm run fala-check` confere a conta —
+  // ela já se desencontrou duas vezes.
+  const SPEAK_TIMEOUT_MS = 70000;
+  // contador visível NA CONVERSA (não só no log de debug) enquanto espera — null = não está
+  // esperando voz nenhuma; número = segundos decorridos desde que a chamada começou. Existe
+  // pra deixar claro que a Lisa ainda está tentando a voz do Gemini (não travou), com quanto
+  // falta pro teto acima antes de cair pro navegador.
+  const [ttsWaitSeconds, setTtsWaitSeconds] = useState(null);
+
+  const synthesizeChunk = useCallback(async (text) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SPEAK_TIMEOUT_MS);
+    const startedAt = Date.now();
+    setTtsWaitSeconds(0);
+    const tickId = setInterval(() => setTtsWaitSeconds(Math.round((Date.now() - startedAt) / 1000)), 1000);
+    try {
+      const res = await fetch("/api/speak", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text, voice: voiceName }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        // extrai a mensagem real do corpo (ex.: "UNAVAILABLE: ...") em vez de só o status —
+        // ajuda a diagnosticar POR QUE o Gemini está falhando, não só QUE falhou.
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.error || `speak HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      return { url: URL.createObjectURL(blob) };
+    } catch (err) {
+      return { url: null, error: err?.name === "AbortError" ? new Error(`Gemini demorou mais de ${SPEAK_TIMEOUT_MS / 1000}s`) : err };
+    } finally {
+      clearInterval(tickId);
+      setTtsWaitSeconds(null);
+      clearTimeout(timeout);
+    }
+  }, [voiceName]);
+
+  // Decide o motor (gemini/navegador) DESTE pedaço — chamado só depois que o pedaço anterior
+  // já teve o motor dele decidido (ver enqueueSpeech), nunca antes. Fica de fora da fila de
+  // REPRODUÇÃO de propósito: decidir é rápido (só espera a resposta do /api/speak, não o
+  // áudio tocar até o fim), então o próximo pedaço já pode começar a sintetizar enquanto o
+  // atual ainda está sendo ouvido — é isso que fecha o gap sem reabrir a corrida de voz.
+  const resolveChunkEngine = useCallback(async (tryGemini, text, antecipada = null) => {
+    const result = tryGemini ? await (antecipada || synthesizeChunk(text)) : { url: null, skipped: true };
+    if (result?.url) {
+      speechEngineRef.current = "gemini";
+      setGeminiVoiceStatus(true);
+      geminiDownUntilRef.current = 0; // deu certo — desarma o disjuntor, se estivesse armado
+    } else {
+      // sem áudio do Gemini pra este pedaço — cai pra voz do navegador. Se isso já
+      // aconteceu na cabeça desta resposta, o resto nem tenta o Gemini de novo (evita
+      // alternar de voz no meio da fala).
+      if (!result?.skipped) {
+        const reason = String(result?.error?.message || "").slice(0, 90);
+        const cooldownSec = Math.round(GEMINI_COOLDOWN_MS / 1000);
+        addLog("[TTS]", OR, `Gemini indisponível${reason ? ` (${reason})` : ""} → voz do navegador (sem tentar de novo por ${cooldownSec}s)`);
+        setGeminiVoiceStatus(false); // só marca "falhou" numa tentativa real — não quando foi pulada de propósito
+        // ARMA o disjuntor: falha de verdade → some tentar o Gemini de novo por um tempo,
+        // em vez de já testar de novo na próxima pergunta (é isso que causava a alternância).
+        geminiDownUntilRef.current = Date.now() + GEMINI_COOLDOWN_MS;
+      }
+      speechEngineRef.current = "browser";
+    }
+    return result;
+  }, [synthesizeChunk, addLog]);
+
+  const playResult = useCallback((result, text, gen) => {
+    if (gen !== speechGenRef.current) {
+      if (result?.url) URL.revokeObjectURL(result.url);
+      return;
+    }
+    return new Promise((resolve) => {
+      currentAudioResolveRef.current = resolve;
+      const finish = () => { currentAudioResolveRef.current = null; resolve(); };
+
+      if (result?.url) {
+        const audio = new Audio(result.url);
+        escutarElemento(audio); // a esfera mede o volume; se o áudio ainda não foi liberado, toca normal
+        audioRef.current = audio;
+        audio.onended = () => { URL.revokeObjectURL(result.url); audioRef.current = null; addLog("[TTS]", GR, "voz Gemini"); finish(); };
+        audio.onerror = () => { URL.revokeObjectURL(result.url); audioRef.current = null; finish(); };
+        // O celular recusa tocar som sem um toque recente: o play() falha e nem onended nem onerror
+        // chegam. Antes, audioRef ficava preso aqui e a Conversa livre esperava a fala acabar para
+        // sempre — "a Lisa fica pensando e nunca responde" (BEYOND-0011).
+        audio.play().catch((err) => {
+          URL.revokeObjectURL(result.url);
+          if (audioRef.current === audio) audioRef.current = null;
+          addLog("[TTS]", OR, `o navegador não deixou tocar a voz: ${err?.name || err}`);
+          finish();
+        });
+      } else {
+        if (typeof window === "undefined" || !window.speechSynthesis) return finish();
+        const clean = cleanForSpeech(text);
+        if (!clean) return finish();
+        const u = new SpeechSynthesisUtterance(clean);
+        u.lang = "pt-BR";
+        u.rate = 1.05;
+        const ptVoice = pickBrowserVoice(window.speechSynthesis.getVoices());
+        if (ptVoice) u.voice = ptVoice;
+        u.onend = finish;
+        u.onerror = finish;
+        window.speechSynthesis.speak(u);
+      }
+    });
+  }, [addLog]);
+
+  const enfileirarPedaco = useCallback((clean, gen) => {
+    // uma fala que já foi parada (ou trocada por uma resposta nova): nem gasta a chamada de voz
+    if (gen !== speechGenRef.current) return;
+    // SÍNTESE ANTECIPADA (BEYOND-0001): o áudio deste pedaço começa a ser gerado JÁ, em
+    // paralelo com os anteriores, e não só quando o anterior fica pronto. Medido com uma
+    // resposta de 733 caracteres em cinco pedaços: gerando um de cada vez, um pedaço lento
+    // (21s) abria 10s de silêncio no meio da fala; em paralelo, ele fica pronto muito antes
+    // de chegar a vez dele. Não custa chamada a mais — são as mesmas, só começam antes.
+    const podeTentarAgora = geminiVoiceEnabled && speechEngineRef.current !== "browser" && Date.now() >= geminiDownUntilRef.current;
+    const antecipada = podeTentarAgora ? synthesizeChunk(clean) : null;
+    // Se no fim a vez deste pedaço for de outro motor (um anterior falhou), o áudio gerado
+    // sobra: solta a memória dele.
+    const descartar = () => { antecipada?.then((r) => { if (r?.url) URL.revokeObjectURL(r.url); }); };
+
+    // fila de DECISÃO: só decide se tenta o Gemini pra este pedaço depois que o pedaço
+    // anterior já sabe o motor dele — fecha a corrida em que, numa resposta curta, o "resto"
+    // decidia tentar o Gemini antes de saber se a "cabeça" tinha falhado (a chamada de TTS é
+    // mais lenta que o streaming do texto, às vezes) — daí cabeça e resto saíam em vozes
+    // diferentes. Rápido (não espera áudio tocar), então não reabre o gap que isso evita.
+    const thisDecision = engineDecisionRef.current.then(() => {
+      if (gen !== speechGenRef.current) { descartar(); return { url: null, skipped: true }; }
+      const tryGemini = geminiVoiceEnabled && speechEngineRef.current !== "browser" && Date.now() >= geminiDownUntilRef.current;
+      if (!tryGemini) descartar();
+      return resolveChunkEngine(tryGemini, clean, tryGemini ? antecipada : null);
+    });
+    engineDecisionRef.current = thisDecision.catch(() => ({ url: null, skipped: true }));
+
+    // fila de REPRODUÇÃO: toca em ordem, esperando o pedaço anterior acabar de tocar — mas o
+    // motor deste pedaço, acima, já pode estar decidido bem antes disso.
+    speechQueueRef.current = speechQueueRef.current.then(async () => {
+      const result = await thisDecision;
+      if (gen !== speechGenRef.current) return;
+      return playResult(result, clean, gen);
+    });
+  }, [resolveChunkEngine, playResult, geminiVoiceEnabled, synthesizeChunk]);
+
+  const enqueueSpeech = useCallback((text, gen) => {
+    const bruto = (text || "").trim();
+    if (!bruto) return;
+
+    // BEYOND-0001: a resposta vai em PEDAÇOS (pedacosParaVoz), não numa chamada só.
+    //
+    // Numa chamada só, uma resposta longa levava mais que o teto do servidor para ser gerada,
+    // caía para a voz do navegador e armava o disjuntor — a issue inteira. Em pedaços, o
+    // primeiro (curto) começa a tocar em poucos segundos e cada seguinte é gerado enquanto o
+    // anterior toca: a fila de DECISÃO de enfileirarPedaco já sintetiza o próximo sem esperar o
+    // áudio do atual acabar. A antiga objeção ("cada pedaço é um sorteio contra uma API que
+    // pendura") era do modelo antigo — ver a medição em gemini.js e cleanForSpeech.js.
+    //
+    // O streaming da resposta ainda pode chamar isto várias vezes; cada chamada corta a sua parte.
+    for (const pedaco of pedacosParaVoz(cleanForSpeech(bruto))) enfileirarPedaco(pedaco, gen);
+  }, [enfileirarPedaco]);
+
+  // ---- escopo do assistente ----
+  const computeScope = useCallback(() => {
+    if (scopeMode === "general") return { mode: "general" };
+    if (scopePanel === TASKS_SCOPE) return { mode: "panel", range: "auto" };
+    if (scopePanel === THOUGHTS_SCOPE) return { mode: "panel", source: "brain" };
+    if (scopePanel === SENTINEL_SCOPE) return { mode: "panel", source: "sentinel", projectId: sentinelProjectId };
+    // escolher este escopo explicitamente JÁ É o consentimento pra falar de tarefas do trabalho —
+    // não passa pelo "quer que eu leve em conta as tarefas do trabalho?" (ver /api/ask), que só existe pra
+    // quando o assunto surge sem o usuário ter pedido isso de propósito.
+    if (scopePanel === WORK_SCOPE) return { mode: "panel", source: "work" };
+    if (scopePanel === CODE_SCOPE) return { mode: "panel", source: "github", repo: codeRepo !== "all" ? codeRepo : null, path: codeFile || null };
+    return { mode: "panel", board: scopePanel };
+  }, [scopeMode, scopePanel, sentinelProjectId, codeRepo, codeFile]);
+
+  // ---- Modo Código: em vez de conversar, PROPÕE uma mudança de código (branch nova + PR) —
+  // narra cada fase (fala e mostra o texto) e mostra o código de cada arquivo sendo escrito
+  // ao vivo, ver /api/code-tasks/stream e runCodeTaskStreaming em src/lib/codeTasks.js.
+  // Roda UM passo (um pedido HTTP próprio, seu PRÓPRIO teto de 60s — ver /api/code-tasks/step)
+  // e devolve o que aconteceu ({taskId, done, ok, error?, pr_url?}) — askCodeMode chama isso
+  // em loop até `done`. Cada passo tem sua fresh janela de 60s, então a tarefa inteira nunca
+  // mais fica presa a uma conexão única (era isso que estourava com pedidos maiores).
+  const runCodeModeStep = useCallback(async ({ taskId, repo, baseBranch, instruction, filePaths, continueBranch, existingPrUrl, gen, narrationSoFarRef, voiceEnabled }) => {
+    const res = await fetch("/api/code-tasks/step", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ taskId, repo, baseBranch, instruction, filePaths, continueBranch, existingPrUrl }),
+    });
+    if (!res.ok || !res.body) { const e = new Error(`HTTP ${res.status}`); e.taskId = taskId; throw e; }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let stepDone = null; // payload do evento "step_done" deste passo, se chegou
+    let seenTaskId = taskId; // capturado do 1º evento que trouxer um (stage já traz, não só step_done) —
+    // assim, mesmo se a conexão cair antes do step_done, dá pra RETOMAR pelo mesmo taskId em
+    // vez de criar uma tarefa nova do zero.
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+      for (const part of parts) {
+        let event = "message", data = "";
+        for (const line of part.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (!data) continue;
+        let payload;
+        try { payload = JSON.parse(data); } catch { continue; }
+        if (payload.taskId) seenTaskId = payload.taskId;
+
+        if (event === "stage") {
+          setCodeStage(payload.stage);
+        } else if (event === "narration") {
+          setMode("speaking");
+          narrationSoFarRef.current += (narrationSoFarRef.current ? "\n\n" : "") + payload.text;
+          setAnswer(narrationSoFarRef.current);
+          answerRef.current = narrationSoFarRef.current;
+          addLog("[CÓDIGO]", PU, payload.text);
+          // fala CADA narração conforme chega — a fila de fala já criada pra respostas
+          // normais (enqueueSpeech) toca cada uma em ordem sozinha, mesmo vindo de vários
+          // pedidos HTTP separados (um por passo).
+          if (voiceEnabled) enqueueSpeech(payload.text, gen);
+        } else if (event === "file_start") {
+          currentCodeFileRef.current = { path: payload.path, content: "" };
+          setLiveCode({ path: payload.path, content: "" });
+        } else if (event === "file_chunk") {
+          if (currentCodeFileRef.current?.path === payload.path) {
+            currentCodeFileRef.current.content += payload.text;
+            setLiveCode({ path: payload.path, content: currentCodeFileRef.current.content });
+          }
+        } else if (event === "file_end") {
+          if (currentCodeFileRef.current?.path === payload.path) {
+            setLiveCodeDone((d) => [...d, currentCodeFileRef.current]);
+          }
+          currentCodeFileRef.current = null;
+          setLiveCode(null);
+        } else if (event === "step_done") {
+          stepDone = payload;
+        }
+      }
+    }
+
+    // esse PASSO fechou sem "step_done" — o teto de 60s matou a função no meio dele. Como
+    // cada passo agora é bem menor que a tarefa inteira, isso deve ser raro, mas ainda pode
+    // acontecer com o Gemini mais lento que o normal. Não é motivo pra desistir — quem chama
+    // (askCodeMode) tenta de novo automaticamente, retomando pelo MESMO taskId (o passo que
+    // foi cortado simplesmente refaz do zero, já que nada foi salvo em code_tasks.state até
+    // ele terminar).
+    if (!stepDone) { const e = new Error("um passo da tarefa foi cortado no meio (estourou 60s) — tentando de novo sozinha"); e.taskId = seenTaskId; throw e; }
+    return stepDone;
+  }, [addLog, enqueueSpeech]);
+
+  const askCodeMode = useCallback(async (q) => {
+    if (!codeModeRepo || !codeModeBranch) {
+      addLog("[CÓDIGO]", OR, "escolha um repositório e uma branch base antes de pedir uma mudança");
+      return;
+    }
+    setBusy(true);
+    setQuestion(q);
+    setAnswer("");
+    setFontes([]);
+    answerRef.current = "";
+    setMode("listening");
+    setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: q, codeMode: true }]);
+    setLiveCode(null);
+    setLiveCodeDone([]);
+    currentCodeFileRef.current = null;
+    setCodeStage(null);
+    setCodeActiveTab(null);
+    setCodeModalMinimized(false);
+    setCodeModalOpen(true); // abre sozinha assim que a tarefa começa — não precisa procurar; fica aberta entre pedidos, não fecha sozinha
+
+    stopSpeaking();
+    const gen = ++speechGenRef.current;
+    speechEngineRef.current = null;
+    const voiceEnabled = voiceOn;
+    const narrationSoFarRef = { current: "" };
+
+    // continua na MESMA branch/PR de uma sessão anterior (mesmo repo+branch base) — assim
+    // "corrige esse erro" vira um commit A MAIS na branch já aberta, não uma tarefa do zero.
+    const continuing = codeSession && codeSession.repo === codeModeRepo && codeSession.baseBranch === codeModeBranch ? codeSession : null;
+
+    try {
+      let taskId = null;
+      let stepResult = null;
+      // chama /api/code-tasks/step repetidas vezes — cada chamada é UM PASSO (contexto,
+      // planejamento, 1 arquivo escrito, criar branch, 1 arquivo commitado, ou abrir o PR) —
+      // até a tarefa inteira terminar. Nunca mais uma única conexão carrega a tarefa toda.
+      // Sem pressa nenhuma: se UM passo isolado falhar (rede, ou raramente estourar os 60s
+      // mesmo já sendo pequeno), tenta de novo sozinha em vez de desistir e jogar o erro pro
+      // usuário — só desiste de verdade depois de várias tentativas seguidas falhando.
+      let retries = 0;
+      const MAX_RETRIES = 20;
+      do {
+        try {
+          stepResult = await runCodeModeStep({
+            taskId, repo: codeModeRepo, baseBranch: codeModeBranch, instruction: q,
+            filePaths: [...codeModeFiles, ...(continuing?.files || [])],
+            continueBranch: continuing?.branchName, existingPrUrl: continuing?.prUrl,
+            gen, narrationSoFarRef, voiceEnabled,
+          });
+          retries = 0; // um passo deu certo — zera a contagem, só desiste de vez em falhas SEGUIDAS
+        } catch (stepErr) {
+          taskId = stepErr.taskId ?? taskId;
+          retries++;
+          if (retries > MAX_RETRIES) throw stepErr;
+          addLog("[CÓDIGO]", OR, `${stepErr.message} (tentativa ${retries}/${MAX_RETRIES})`);
+          await new Promise((r) => setTimeout(r, Math.min(2000 * retries, 15000)));
+          continue;
+        }
+        taskId = stepResult.taskId ?? taskId;
+      } while (!stepResult?.done);
+
+      setCodeStage(stepResult.ok ? "done" : "error");
+      const finalText = stepResult.ok
+        ? `${narrationSoFarRef.current}\n\nPR ${continuing ? "atualizado" : "aberto"}: ${stepResult.pr_url}`
+        : `${narrationSoFarRef.current}${narrationSoFarRef.current ? "\n\n" : ""}⚠ ${stepResult.error || "não consegui completar a tarefa"}`;
+      setAnswer(finalText);
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: finalText, codeMode: true }]);
+      if (stepResult.ok) {
+        addLog("[CÓDIGO]", GR, `PR ${continuing ? "atualizado" : "aberto"}: ${stepResult.pr_url}`);
+        // guarda a sessão pro PRÓXIMO pedido continuar na mesma branch/PR em vez de recomeçar
+        setCodeSession({
+          repo: codeModeRepo, baseBranch: codeModeBranch,
+          branchName: stepResult.branchName, prUrl: stepResult.pr_url,
+          files: stepResult.files || [],
+        });
+      } else {
+        addLog("[CÓDIGO]", OR, stepResult.error || "falhou");
+      }
+    } catch (err) {
+      setCodeStage("error");
+      addLog("[CÓDIGO]", OR, err.message);
+      const finalText = `${narrationSoFarRef.current}${narrationSoFarRef.current ? "\n\n" : ""}⚠ ${err.message}`;
+      setAnswer(finalText);
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: finalText, codeMode: true }]);
+    } finally {
+      setBusy(false);
+      setMode("idle");
+      currentCodeFileRef.current = null;
+      setLiveCode(null);
+    }
+  }, [codeModeRepo, codeModeBranch, codeModeFiles, codeSession, addLog, voiceOn, stopSpeaking, enqueueSpeech, runCodeModeStep]);
+
+  // Modo Vigia sob demanda: pergunta sobre o HISTÓRICO de observações do Modo Tela (não a tela
+  // ao vivo) — chamada única, sem streaming (bem rápida, não precisa do mecanismo de passos do
+  // Modo Código). Funciona de qualquer dispositivo, mesmo sem a tela sendo compartilhada aqui.
+  const askVigiaMode = useCallback(async (q) => {
+    setBusy(true);
+    setQuestion(q);
+    setAnswer("");
+    setFontes([]);
+    const idDaIde = abrirNaIde(q);
+    answerRef.current = "";
+    setMode("listening");
+    setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: q, vigiaMode: true }]);
+
+    stopSpeaking();
+    const gen = ++speechGenRef.current;
+    speechEngineRef.current = null;
+    const voiceEnabled = voiceOn;
+    setMode("speaking");
+
+    try {
+      const res = await fetch("/api/screen-watch/ask", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ question: q, personaMode }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+      const finalText = data.answer;
+      setAnswer(finalText);
+      answerRef.current = finalText;
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: finalText, vigiaMode: true }]);
+      addLog("[VIGIA]", PU, finalText);
+      if (voiceEnabled) enqueueSpeech(finalText, gen);
+    } catch (err) {
+      const finalText = `⚠ ${err.message}`;
+      setAnswer(finalText);
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: finalText, vigiaMode: true }]);
+      addLog("[VIGIA]", OR, err.message);
+    } finally {
+      setBusy(false);
+      setMode("idle");
+      guardarNaIde(idDaIde, q, answerRef.current);
+    }
+  }, [personaMode, addLog, voiceOn, stopSpeaking, enqueueSpeech, abrirNaIde, guardarNaIde]);
+
+  // o usuário não liga os modos do admin (e o que veio ligado do navegador desliga)
+  useEffect(() => {
+    if (!usuario) return;
+    setCodeMode(false); setObservanceMode(false); setVigiaMode(false); setVigiaAutoOn(false); setVigiaWatching(false);
+    setCameraWatching(false); setCameraVigiaMode(false); setMicWatchMode(false); setRadioMode(false);
+    setTransmissionMode(false); setInteractiveMode(false); setPersonaMode(false);
+  }, [usuario, codeMode, observanceMode, vigiaMode, vigiaAutoOn, vigiaWatching, cameraWatching, cameraVigiaMode, micWatchMode, radioMode, transmissionMode, interactiveMode, personaMode]);
+
+  // ---- a entrevista do primeiro acesso (o USUÁRIO do MVP; src/lib/modoUsuario.js) ----
+  // Em duas etapas, cada uma com o convite antes ("sim" começa; "agora não"/"depois" deixa para outra
+  // sessão): 1) SOBRE VOCÊ — nome, quem a pessoa é, o jeito dela, algo importante —, de onde a Lisa
+  // escreve o retrato da pessoa; 2) ESTUDOS E TRABALHO. Uma pergunta por vez; ao fim de cada etapa, o
+  // perfil vai para /api/perfil (que junta com o que já existe e reescreve o retrato). "apague meu
+  // perfil" apaga de verdade.
+  const responderSemServidor = (q, texto, displayText) => {
+    const shown = displayText || q;
+    setQuestion(shown);
+    setAnswer(texto);
+    setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: shown }, { id: `a${Date.now() + 1}`, role: "assistant", text: texto }]);
+    conversaRef.current = adicionarTurno(adicionarTurno(conversaVigente(conversaRef.current), "voce", q), "lisa", texto);
+    if (voiceOn) enqueueSpeech(texto, ++speechGenRef.current);
+  };
+  const adiadaNestaSessao = (etapa) => { try { return sessionStorage.getItem(`lisa-entrevista-adiada-${etapa}`) === "1"; } catch { return false; } };
+  const adiarNestaSessao = (etapa) => { try { sessionStorage.setItem(`lisa-entrevista-adiada-${etapa}`, "1"); } catch { /* sem armazenamento */ } };
+  const perguntaNumerada = (etapa, i) => {
+    const lista = perguntasDaEtapa(etapa);
+    return `(${i + 1} de ${lista.length}) ${lista[i].pergunta}`;
+  };
+  useEffect(() => {
+    if (!usuario) return undefined;
+    let vivo = true;
+    fetch("/api/perfil").then((r) => r.json()).then((j) => {
+      if (!vivo || !j?.ok || entrevistaRef.current.estado) return;
+      const etapa = etapaQueFalta(j.perfil);
+      if (!etapa || adiadaNestaSessao(etapa)) return;
+      const convite = etapa === 1 ? PEDIDO_DE_CONSENTIMENTO : pedidoDaSegundaEtapa(j.perfil?.nome, { depois: true });
+      entrevistaRef.current = { estado: "convite", etapa, i: 0, respostas: {}, nome: j.perfil?.nome || "" };
+      setAnswer(convite);
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: convite }]);
+      lembrarDaLisa(convite);
+    }).catch(() => {});
+    return () => { vivo = false; };
+  }, [usuario]); // eslint-disable-line react-hooks/exhaustive-deps
+  entrevistaFazRef.current = async (q, displayText) => {
+    const e = entrevistaRef.current;
+    const t = q.trim();
+    if (!e.estado) {
+      if (PEDE_APAGAR_PERFIL.test(t)) {
+        const r = await fetch("/api/perfil", { method: "DELETE" }).then((x) => x.json()).catch(() => ({}));
+        responderSemServidor(q, r.ok ? "Apaguei o seu perfil: o que você me contou na entrevista não está mais guardado. Se quiser recomeçar, diga \"quero fazer a entrevista\"." : "Não consegui apagar o perfil agora. Tente de novo em instantes.", displayText);
+        return true;
+      }
+      const querEstudos = /\b(perguntas?\s+(dos|sobre\s+os?|de)\s+estudos?|segunda\s+(etapa|parte)|continuar\s+a\s+entrevista)\b/i.test(t);
+      if (querEstudos || /\b(fazer|refazer|come[cç]ar|recome[cç]ar)\s+(a\s+)?entrevista\b/i.test(t)) {
+        const etapa = querEstudos ? 2 : 1;
+        entrevistaRef.current = { estado: "convite", etapa, i: 0, respostas: {}, nome: e.nome || "" };
+        responderSemServidor(q, etapa === 1 ? PEDIDO_DE_CONSENTIMENTO : pedidoDaSegundaEtapa(e.nome, { depois: true }), displayText);
+        return true;
+      }
+      return false;
+    }
+    if (e.estado === "convite") {
+      const r = respostaAoConvite(t);
+      if (r === "sim") {
+        entrevistaRef.current = { ...e, estado: "pergunta", i: 0, respostas: {} };
+        responderSemServidor(q, `Combinado! ${perguntaNumerada(e.etapa, 0)}`, displayText);
+        return true;
+      }
+      entrevistaRef.current = { estado: null, etapa: e.etapa, i: 0, respostas: {}, nome: e.nome };
+      adiarNestaSessao(e.etapa);
+      if (r === "nao") {
+        responderSemServidor(q, e.etapa === 1
+          ? "Tudo bem! Quando quiser, diga \"quero fazer a entrevista\". Pode me perguntar o que precisar."
+          : "Tudo bem, fica para depois. Quando quiser, diga \"vamos às perguntas dos estudos\".", displayText);
+        return true;
+      }
+      return false; // outro assunto: segue a conversa normal
+    }
+    if (/^(cancel[ae]|par[ae]|sair|chega)\b|\b(cancel[ae]|par[ae]r?)\s+(a\s+)?entrevista\b/i.test(t)) {
+      entrevistaRef.current = { estado: null, etapa: e.etapa, i: 0, respostas: {}, nome: e.nome };
+      adiarNestaSessao(e.etapa);
+      responderSemServidor(q, "Parei a entrevista e não guardei o que faltava desta parte. Quando quiser, diga \"quero fazer a entrevista\".", displayText);
+      return true;
+    }
+    const lista = perguntasDaEtapa(e.etapa);
+    const respostas = { ...e.respostas, [lista[e.i].campo]: t };
+    const i = e.i + 1;
+    if (i < lista.length) {
+      entrevistaRef.current = { ...e, i, respostas };
+      responderSemServidor(q, perguntaNumerada(e.etapa, i), displayText);
+      return true;
+    }
+    // fim da etapa: guarda (o servidor junta com o que já existe e reescreve o retrato da pessoa)
+    entrevistaRef.current = { estado: null, etapa: e.etapa, i: 0, respostas: {}, nome: e.nome };
+    setAnswer("Anotando…");
+    const dados = perfilDaEtapa(e.etapa, respostas);
+    const r = await fetch("/api/perfil", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ consentimento: true, ...dados, retrato: true }) })
+      .then((x) => x.json()).catch(() => ({}));
+    const nome = r.perfil?.nome || dados.nome || e.nome || "";
+    if (!r.ok) {
+      responderSemServidor(q, "Não consegui guardar as suas respostas agora. Sigo te ajudando assim mesmo, e você pode pedir \"quero fazer a entrevista\" depois.", displayText);
+      return true;
+    }
+    if (e.etapa === 1) {
+      // a etapa 1 acabou: já convida para a 2
+      entrevistaRef.current = { estado: "convite", etapa: 2, i: 0, respostas: {}, nome };
+      responderSemServidor(q, `Guardei, obrigada! ${pedidoDaSegundaEtapa(nome)}`, displayText);
+      return true;
+    }
+    responderSemServidor(q, `Pronto${nome ? `, ${nome}` : ""}! Agora eu te conheço e sei como te ajudar. Para apagar o que você me contou, é só dizer "apague meu perfil". Por onde começamos?`, displayText);
+    return true;
+  };
+
+  // ---- pergunta real ao backend (SSE) ----
+  // `displayText` (opcional) — o que aparece no chat/log, quando diferente do `q` de verdade
+  // mandado pro backend. Existe pra réplica do Modo Escuta (ver listenForReply abaixo): a
+  // pergunta enviada carrega um lembrete de qual foi o último comentário da Lisa (pro Gemini
+  // entender a que "isso" se refere), mas mostrar esse lembrete pro usuário seria estranho —
+  // ele só vê a própria fala transcrita, limpa.
+  const ask = useCallback(async (q, { displayText, alvoDaIde = null } = {}) => {
+    if (!q.trim() || busy) return;
+
+    // a resposta ao "posso fazer?" de um pedido sobre o projeto (01/11/2026): "sim" faz; "não" cancela;
+    // uma correção refaz o entendimento com ela e pergunta de novo; outro assunto deixa o pedido de lado
+    // o USUÁRIO do MVP: a entrevista do primeiro acesso e o "apague meu perfil", sem o servidor da conversa
+    if (usuarioRef.current && !alvoDaIde && await entrevistaFazRef.current?.(q, displayText)) return;
+
+    const pendente = planoPendenteRef.current;
+    if (pendente && !alvoDaIde) {
+      planoPendenteRef.current = null;
+      const resposta = Date.now() - pendente.em < VALIDADE_DA_CONFIRMACAO_MS ? respostaDeConfirmacao(q) : null;
+      if (resposta === "sim") return executarPendenteRef.current?.(pendente, displayText || q);
+      if (resposta === "nao") {
+        const texto = "Tudo bem, não fiz nada.";
+        setQuestion(displayText || q);
+        setAnswer(texto);
+        setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: displayText || q }, { id: `a${Date.now() + 1}`, role: "assistant", text: texto }]);
+        conversaRef.current = adicionarTurno(adicionarTurno(conversaVigente(conversaRef.current), "voce", q), "lisa", texto);
+        if (voiceOn) enqueueSpeech(texto, ++speechGenRef.current);
+        return;
+      }
+      if (resposta === "corrige") {
+        const corrigido = `${pendente.q}\n\nCORREÇÃO DA PESSOA sobre o que eu entendi (vale mais que o pedido acima): ${q}`;
+        const plano = await planejarNoProjetoRef.current?.(corrigido, pendente.doProjeto, displayText || q, { imagens: pendente.imagens });
+        if (plano?.acao === "mudar" || plano?.acao === "documentar") return confirmarNoProjetoRef.current?.(corrigido, { displayText: displayText || q, doProjeto: pendente.doProjeto, plano, imagens: pendente.imagens });
+      }
+    }
+
+    // o "sim" ao "Posso fazer?" da conversa comum: desenha o pedido que ela entendeu (com a tela e os
+    // prints daquela hora); qualquer outra coisa deixa o pedido de lado e segue normal
+    const desenhoPendente = desenhoPendenteRef.current;
+    if (desenhoPendente && !alvoDaIde) {
+      desenhoPendenteRef.current = null;
+      if (Date.now() - desenhoPendente.em < VALIDADE_DA_CONFIRMACAO_MS && respostaDeConfirmacao(q) === "sim") {
+        return fazerDesenhoConfirmadoRef.current?.(desenhoPendente, displayText || q);
+      }
+    }
+
+    // a tela e os prints anexados, uma vez por pergunta (o desenho e o plano também os veem: "pegue o
+    // exercício da minha tela e estruture no ProcessMap"); a câmera só vai para a conversa
+    const comOrigem = (img, origem) => (img ? { ...img, origem } : null);
+    let imagensDaVez = null;
+    const imagensDoPedido = () => (imagensDaVez ??= [
+      ...anexosRef.current.map((a) => ({ mimeType: a.mimeType, data: a.data, origem: "anexo", nome: a.nome })),
+      screenMode && comOrigem(captureScreenFrame(), "tela"),
+    ].filter(Boolean));
+
+    // "abre o dashboard" etc. — comando local reconhecido sem gastar chamada nenhuma do
+    // Gemini: não passa pelo fluxo normal de pergunta/resposta, só avisa os OUTROS
+    // dispositivos abertos (ver RemoteCommandListener.js) e confirma na hora.
+    // "tomar nota sobre X": abre o Modo Tomar nota com o tema já preenchido. Não começa a
+    // gravar sozinho — o microfone abre no toque de "Começar", que é um gesto da pessoa.
+    const temaDaNota = pedidoDeTomarNota(q);
+    if (temaDaNota !== null) {
+      const confirmText = temaDaNota ? `Abri o Tomar nota sobre "${temaDaNota}". Toque em Começar a escutar.` : "Abri o Tomar nota. Diga ou digite o tema e toque em Começar a escutar.";
+      setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: displayText || q }, { id: `a${Date.now() + 1}`, role: "assistant", text: confirmText }]);
+      setTomarNota({ tema: temaDaNota });
+      return;
+    }
+
+    const nav = matchNavCommand(q);
+    if (nav) {
+      stopSpeaking();
+      const gen = ++speechGenRef.current;
+      speechEngineRef.current = null;
+      const confirmText = `Abrindo ${nav.label} nos outros dispositivos.`;
+      setQuestion(q);
+      setAnswer(confirmText);
+      setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: q }, { id: `a${Date.now() + 1}`, role: "assistant", text: confirmText }]);
+      addLog("[REMOTE]", PU, `→ ${nav.label} (${nav.target})`);
+      fetch("/api/remote-command", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ target: nav.target, originDevice: getDeviceId() }),
+      }).catch((err) => addLog("[REMOTE]", OR, `falha: ${err.message}`));
+      if (voiceOn) enqueueSpeech(confirmText, gen);
+      return;
+    }
+
+    // Pedido de card no Abacato (criar, concluir, excluir…) vale em QUALQUER modo: no Modo Código
+    // ele viraria um pedido de código, e no Vigia uma pergunta sobre a tela.
+    const acaoNoAbacato = pareceAcao(q, ["abacato", "abacato_escolha", "abacato_rascunho"].includes(pendingActionRef.current?.type));
+
+    // Modo Código ligado: a pergunta vira um pedido de mudança de código, não uma conversa —
+    // ver askCodeMode acima.
+    if (codeMode && !acaoNoAbacato) return askCodeMode(q);
+
+    // Modo Vigia ligado: a pergunta busca no histórico de observações do Modo Tela — ver
+    // askVigiaMode acima.
+    if (vigiaMode && !acaoNoAbacato) return askVigiaMode(q);
+
+    // "desenhe o processo de…" (ou, com o quadro aberto, "inclua uma etapa…"): a Lisa desenha no
+    // quadro em vez de responder em texto (BEYOND-0010) — ver desenharNaTela abaixo
+    // "no projeto X do ProcessMap, …" (01/11/2026): o projeto citado vale ANTES da regra do Abacato
+    // ("uma versão do Abacato integrada à Lisa" é conteúdo do desenho, não um card). A Lisa planeja com
+    // o modelo — entende a intenção mesmo com erro de digitação, e um pedido que mexe em vários desenhos
+    // de uma vez — e trabalha no projeto (trabalharNoProjetoRef). Se for pergunta, responde com os
+    // desenhos do projeto junto. Sem plano (o modelo falhou), o caminho antigo: um desenho, por palavras.
+    const doProjeto = !alvoDaIde ? await resolverProjetoRef.current?.(q) : null;
+    // falou de projeto sem dizer qual, e há mais de um: pergunta, em vez de escolher (BEYOND-0013)
+    if (doProjeto?.perguntar) {
+      const texto = perguntaDoProjeto(doProjeto.perguntar);
+      setQuestion(displayText || q);
+      setAnswer(texto);
+      setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: displayText || q }, { id: `a${Date.now() + 1}`, role: "assistant", text: texto }]);
+      conversaRef.current = adicionarTurno(adicionarTurno(conversaVigente(conversaRef.current), "voce", q), "lisa", texto);
+      addLog("[PROCESSMAP]", PU, "falou de projeto sem dizer qual: perguntei");
+      if (voiceOn) enqueueSpeech("Em qual projeto do ProcessMap? Os nomes estão na tela.", ++speechGenRef.current);
+      return;
+    }
+    if (doProjeto) {
+      // o plano diz o que desenhar e quais .md escrever no editor (01/11/2026: "faça um fluxograma da
+      // arquitetura … e um md também" — um pedido pode ter os dois); num pedido de documento, a rota do
+      // plano tira as mudanças de desenho que não foram pedidas. Sem o modelo, o documento ainda sai.
+      let plano = (await planejarNoProjetoRef.current?.(q, doProjeto, displayText, { imagens: imagensDoPedido() }))
+        || (pedeDocumentacao(q) ? ajustarAoPedido({ acao: "documentar", explicacao: "", operacoes: [], documentos: [] }, q, doProjeto.fluxos) : null);
+      // (02/11/2026) "faça um BPMN de…" que o modelo leu como pergunta: é um desenho novo no projeto
+      // (a Lisa confirma antes, como sempre)
+      if (plano?.acao === "responder" && !q.includes("?") && pedeNovoDesenho(q)) plano = planoDeDesenhoNovo(q);
+      // (01/11/2026: "ela tem que interpretar e saber o que eu quero, porém deve me perguntar se eu tenho
+      // certeza; se eu disser sim, aí ela faz") — mostra o que entendeu e espera o "sim"
+      if (plano?.acao === "documentar" || plano?.acao === "mudar") return confirmarNoProjetoRef.current?.(q, { displayText, doProjeto, plano, imagens: imagensDoPedido() });
+      if (!plano) {
+        // sem o plano (o modelo falhou duas vezes), só um desenho NOVO sai sem confirmar — mudar o que
+        // existe por palavra-chave, sem entender o pedido, é o que estragou a aba "Fluxo Desktop"
+        const semPlano = pedidoDeDesenho(q, { quadroAberto: true });
+        const alvo = semPlano === "novo" && !/\bnov[oa]s?\b/i.test(q) ? doProjeto.citado : null;
+        if (semPlano === "novo" && !alvo) {
+          doProjeto.alvo = alvo;
+          doProjeto.texto = contextoDoProjeto(doProjeto.projeto, doProjeto.fluxos, { alvo });
+          return desenharNaTelaRef.current?.(q, { displayText, mudar: Boolean(alvo), doProjeto, imagens: imagensDoPedido() });
+        }
+      }
+      doProjeto.texto = contextoDoProjeto(doProjeto.projeto, doProjeto.fluxos);
+    }
+    const desenho = !acaoNoAbacato && !alvoDaIde && !doProjeto ? pedidoDeDesenho(q, { quadroAberto: quadroAbertoRef.current }) : null;
+    if (desenho) return desenharNaTelaRef.current?.(q, { displayText, mudar: desenho === "alterar", imagens: imagensDoPedido() });
+
+    const shown = displayText || q;
+    setBusy(true);
+    setQuestion(shown);
+    setAnswer("");
+    setFontes([]);
+    const idDaIde = abrirNaIde(shown, alvoDaIde);
+    answerRef.current = "";
+    fontesRef.current = [];
+    setCards([]);
+    setMode("listening");
+    setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: shown, anexos: anexosRef.current.map((a) => ({ id: a.id, previa: a.previa, nome: a.nome })) }]);
+
+    stopSpeaking(); // corta qualquer fala de uma resposta anterior
+    const gen = ++speechGenRef.current;
+    speechEngineRef.current = null; // nova resposta → nova chance pro Gemini decidir a voz
+    const voiceEnabled = voiceOn;
+    // A FALA AO VIVO (07/11/2026, src/lib/falaAoVivo.js): a voz começa na primeira frase, enquanto o
+    // resto da resposta ainda chega — antes, esperava a resposta inteira.
+    //
+    // O texto que chegou é guardado AQUI, na hora, e não lido do answerRef: o answerRef só muda quando
+    // o React aplica o setAnswer, e no fim da resposta ele podia estar umas palavras atrás. A fala
+    // achava que a resposta tinha sido trocada e falava TUDO de novo ("ela fala uma vez e depois
+    // repete", 07/11/2026). `textoDaFala` é o recebido exato (a fala ao vivo conta posições nele);
+    // `textoDaTela` é o mesmo com o acabamento da tela (o aviso de erro aparado).
+    const falaAoVivo = voiceEnabled ? criarFalaAoVivo() : null;
+    let textoDaFala = "";
+    let textoDaTela = "";
+    let trocada = false; // a resposta virou outra mensagem (veio vazia; a conexão caiu)
+    let vozComecou = false;
+
+    addLog("[EMBED]", GR, "query → vector [768d]");
+    addLog("[RAG]", CY, "similarity search · top_k");
+
+    let latestCards = [];
+
+    // um link de repositório do GitHub na mensagem já vincula ele à conversa
+    const linkados = reposNoTexto(q);
+    if (linkados.length) {
+      guardarRepos(vinculosValidos([...linkados.map((l) => ({ repo: l.repo, branch: l.branch })), ...reposRef.current]));
+      addLog("[REPO]", PU, `vinculado pelo link: ${linkados.map((l) => l.repo).join(", ")}`);
+    }
+
+    // as imagens, na ordem que a nota do servidor explica: as anexadas pela pessoa, a tela (Modo
+    // Tela) e a câmera (Observância) — cada uma só entra se existir; nenhuma depende da outra.
+    const images = [
+      ...imagensDoPedido(),
+      observanceMode && comOrigem(captureObservanceFrame(), "camera"),
+    ].filter(Boolean);
+    let pedeDesenho = false; // a Lisa entendeu um pedido de desenho e perguntou "Posso fazer?"
+
+    // Os repositórios vinculados são lidos ANTES, num pedido só deles: dentro do /api/ask, as
+    // chamadas ao GitHub somavam com as da pergunta e estouravam o limite de 50 chamadas de rede
+    // por pedido do Worker ("Too many subrequests", 25/10/2026). A seção pronta vai na pergunta.
+    let contextoDosRepos = null;
+    if (reposRef.current.length) {
+      setLeituraDosRepos({ lendo: true });
+      addLog("[REPO]", PU, `lendo ${reposRef.current.map((r) => r.repo).join(", ")}…`);
+      try {
+        const r = await fetch("/api/repos/contexto", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ repos: reposRef.current, question: q, turnos: conversaVigente(conversaRef.current), images: images.length ? images : null }),
+        });
+        const leitura = await r.json().catch(() => ({}));
+        if (!r.ok || leitura.ok === false) throw new Error(leitura.error || `HTTP ${r.status}`);
+        contextoDosRepos = { secao: leitura.secao || "" };
+        setLeituraDosRepos(leitura);
+        addLog("[REPO]", PU, `${leitura.lidos?.length || 0} arquivo(s) lido(s): ${(leitura.lidos || []).map((l) => l.path).join(", ") || "—"}`);
+        for (const aviso of leitura.avisos || []) addLog("[REPO]", OR, aviso);
+      } catch (err) {
+        // sem a leitura, a pergunta segue assim mesmo (a Lisa avisa que não viu o código)
+        setLeituraDosRepos({ lidos: [], repos: [], avisos: reposRef.current.map((r) => `Não consegui ler ${r.repo}: ${err.message}`) });
+        addLog("[REPO]", OR, `a leitura do repositório falhou: ${err.message}`);
+      }
+    }
+
+    try {
+      const res = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          question: q, scope: computeScope(), personaMode,
+          history: { ...(historyRef.current || {}), turnos: conversaVigente(conversaRef.current), ultimaResposta: ultimaRespostaRef.current.slice(0, 8000) },
+          // o código que já apareceu na conversa, inteiro (a conversa vai cortada por fala): para a
+          // Lisa ver o todo antes de propor uma correção. Conversa vencida (30 min parada) não leva.
+          // e o que está escrito ou mudado na IDE agora (BEYOND-0009), que vale mais que a versão da conversa
+          codigo: [
+            conversaVigente(conversaRef.current).length ? codigoDaConversa(mensagensRef.current.slice(-24).map((m) => m.text)) : "",
+            codigoDaIdeRef.current,
+          ].filter(Boolean).join("\n\n"),
+          // o desenho do quadro como está agora, em texto (BEYOND-0010): a Lisa vê o que a pessoa mudou
+          diagrama: quadroAbertoRef.current && desenhoRef.current ? descreverDiagrama(desenhoRef.current) : "",
+          // o projeto do ProcessMap citado na pergunta, com os desenhos dele (01/11/2026)
+          projeto: doProjeto?.texto || "",
+          pendingAction: pendingActionRef.current,
+          images: images.length ? images : null,
+          // o código dos repositórios vinculados, já lido acima (/api/repos/contexto)
+          contextoDosRepos,
+        }),
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let chegouErro = false;
+      let terminou = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+        for (const part of parts) {
+          let event = "message", data = "";
+          for (const line of part.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) data += line.slice(5).trim();
+          }
+          if (!data) continue;
+          let payload;
+          try { payload = JSON.parse(data); } catch { payload = data; }
+
+          if (event === "context") {
+            latestCards = payload || [];
+            setCards(latestCards);
+            addLog("[MATCH]", GR, `${latestCards.length} cards recuperados`);
+            setMode("speaking");
+            addLog("[GEMINI]", OR, "streaming tokens");
+          } else if (event === "action") {
+            pendingActionRef.current = payload?.pending || null;
+            if (payload?.debug && payload?.detectError) addLog("[ACTION]", OR, `detecção FALHOU (não é "não entendi", é erro de verdade): ${payload.detectError}`);
+            else if (payload?.debug) addLog("[ACTION]", PU, `nenhuma ação detectada (intent=${payload.checkedIntent})`);
+            else if (pendingActionRef.current) addLog("[ACTION]", PU, "aguardando confirmação…");
+            else addLog("[ACTION]", PU, "resolvida");
+          } else if (event === "repos") {
+            setLeituraDosRepos(payload);
+            addLog("[REPO]", PU, `${payload?.lidos?.length || 0} arquivo(s) lido(s): ${(payload?.lidos || []).map((l) => l.path).join(", ") || "—"}`);
+            for (const aviso of payload?.avisos || []) addLog("[REPO]", OR, aviso);
+          } else if (event === "pesquisa") {
+            addLog("[WEB]", PU, payload?.buscador
+              ? `pesquisei "${payload.consulta}" no ${payload.buscador}: ${payload.total} resultado(s), ${payload.lidas} página(s) lida(s)`
+              : `a pesquisa por "${payload?.consulta}" falhou: ${(payload?.erros || []).join(" · ")}`);
+          } else if (event === "fontes") {
+            fontesRef.current = Array.isArray(payload) ? payload : [];
+            setFontes(fontesRef.current);
+            addLog("[WEB]", PU, `${fontesRef.current.length} fonte(s): ${fontesRef.current.map((f) => f.titulo).join(", ")}`);
+          } else if (event === "token") {
+            textoDaFala += payload;
+            textoDaTela += payload;
+            setAnswer((a) => { const na = a + payload; answerRef.current = na; return na; });
+            // cada frase completa já vai para a fila da voz (a síntese começa na hora, em paralelo)
+            if (falaAoVivo) {
+              for (const pedaco of falaAoVivo.novos(textoDaFala)) {
+                if (!vozComecou) { vozComecou = true; addLog("[TTS]", CY, `voz começando com a resposta ainda chegando (${textoDaFala.length} caracteres recebidos)`); }
+                enfileirarPedaco(pedaco, gen);
+              }
+            }
+          } else if (event === "error") {
+            chegouErro = true;
+            addLog("[ERR]", OR, String(payload?.message || payload));
+            // o erro vai para a fala (textoDaFala), para a tela (textoDaTela) e para answerRef, de onde sai a bolha do chat do celular (antes, a bolha ficava vazia)
+            textoDaFala += `\n[erro: ${payload?.message || payload}]`;
+            textoDaTela = `${textoDaTela}\n[erro: ${payload?.message || payload}]`.trim();
+            setAnswer((a) => { const na = `${a}\n[erro: ${payload?.message || payload}]`.trim(); answerRef.current = na; return na; });
+          } else if (event === "desenho") {
+            pedeDesenho = true;
+          } else if (event === "done") {
+            terminou = true;
+            addLog("[STATE]", CY, "core → IDLE · standby");
+          }
+        }
+      }
+      // A resposta inteira, com certeza: o answerRef pode estar umas palavras atrás (ver textoDaTela).
+      // Sem isto, a bolha guardada e a aba do editor podiam perder o finalzinho da resposta.
+      if (answerRef.current !== textoDaTela) {
+        answerRef.current = textoDaTela;
+        setAnswer(textoDaTela);
+      }
+      // Nada de texto e nenhum erro: a janela ficava em "processando" para sempre (ela mostra isso
+      // enquanto a resposta está vazia). Agora a Lisa diz o que houve (BEYOND-0011).
+      if (!textoDaTela.trim() && !chegouErro) {
+        const aviso = terminou
+          ? "Não consegui formar uma resposta agora (veio vazia). Pergunte de novo, por favor."
+          : "A conexão caiu antes de a resposta chegar. Pergunte de novo, por favor.";
+        addLog("[ERR]", OR, terminou ? "resposta vazia do servidor" : "o stream fechou sem o fim");
+        answerRef.current = aviso;
+        setAnswer(aviso);
+        trocada = true;
+      }
+      if (pedeDesenho) {
+        desenhoPendenteRef.current = { q, imagens: images.filter((i) => i.origem !== "camera"), em: Date.now() };
+        addLog("[QUADRO]", PU, "pedido de desenho entendido na conversa — esperando o \"sim\"");
+      }
+      historyRef.current = { question: q, cards: latestCards };
+      conversaRef.current = adicionarTurno(adicionarTurno(conversaVigente(conversaRef.current), "voce", q), "lisa", answerRef.current);
+      if (answerRef.current.trim()) ultimaRespostaRef.current = answerRef.current;
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: answerRef.current, ...(fontesRef.current.length ? { fontes: fontesRef.current } : {}) }]);
+    } catch (err) {
+      addLog("[ERR]", OR, err.message);
+      answerRef.current = `Falha ao consultar o backend: ${err.message}`;
+      setAnswer(answerRef.current);
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: `Falha ao consultar o backend: ${err.message}` }]);
+      trocada = true;
+    } finally {
+      setBusy(false);
+      setMode("idle");
+      // a resposta com código vira uma aba do editor e fica lá (a próxima pergunta não apaga)
+      guardarNaIde(idDaIde, shown, answerRef.current, alvoDaIde);
+      // O que falta falar, agora que a resposta acabou de chegar: a fala ao vivo já mandou as frases
+      // completas; aqui vai SÓ o resto (a última frase, um aviso de erro), contado no texto recebido —
+      // nunca a resposta de novo. O rascunho de um card fica só na tela: ela fala o que mudou. Se a
+      // resposta foi TROCADA (veio vazia; a conexão caiu), a mensagem nova vai pelo caminho de sempre.
+      if (falaAoVivo && !trocada) {
+        for (const pedaco of falaAoVivo.novos(textoDaFala, { fim: true })) enfileirarPedaco(pedaco, gen);
+      } else if (falaAoVivo) {
+        const full = falaSemRascunho(answerRef.current).trim();
+        if (full) enqueueSpeech(full, gen);
+      }
+    }
+  }, [busy, addLog, voiceOn, computeScope, stopSpeaking, enqueueSpeech, enfileirarPedaco, personaMode, observanceMode, captureObservanceFrame, screenMode, captureScreenFrame, codeMode, askCodeMode, vigiaMode, askVigiaMode, abrirNaIde, guardarNaIde, guardarRepos]);
+  askRef.current = ask; // ver comentário no askRef acima — mantém sempre a versão mais recente pros efeitos de vigília chamarem
+
+  // ---- O quadro da Lisa (BEYOND-0010): ela desenha o processo e a pessoa mexe ----
+  //
+  // O pedido vai para /api/diagrama (a IA monta a estrutura, o servidor faz o layout) junto do
+  // desenho que já está na tela, se houver: assim "inclua uma etapa" parte do fluxo como a pessoa
+  // deixou, e o que ela arrumou fica no lugar. A explicação da Lisa vira a resposta da conversa (e é
+  // falada, se a voz estiver ligada); o desenho aparece no quadro.
+  // `mudar`: o pedido é mudar o desenho que está no quadro (ele vai junto); senão é um desenho novo
+  // quem acha o projeto do ProcessMap da pergunta (src/lib/processmapNaConversa.js): o citado pelo nome
+  // ou — "anote todos os fluxogramas do projeto", sem nome — o projeto em que se está trabalhando (o do
+  // fluxo aberto no quadro, ou o último desta conversa). Devolve { projeto, fluxos (com os documentos),
+  // citado (o fluxo citado pelo nome), provavel (o aberto no quadro, se for desse projeto, ou o único) },
+  // ou null
+  resolverProjetoRef.current = async (q) => {
+    // O projeto só entra quando é EXPLÍCITO (03/11/2026, BEYOND-0013: "se eu não falo qual é o projeto,
+    // ela supõe um e isso está errado"): a pessoa fala de projeto (o nome pode vir pela metade ou com
+    // erro), nomeia um desenho salvo, ou mexe no desenho aberto no quadro, que já é de um projeto.
+    // Desenho novo sem projeto é avulso, no quadro; o 💾 salvar dele escolhe um projeto ou cria um.
+    // A regra mora em projetoDoPedido (src/lib/processmapNaConversa.js, testada).
+    const vinculado = quadroVinculoRef.current?.projeto || null;
+    const emUso = vinculado || ultimoProjetoRef.current;
+    const citado = citaProjeto(q);
+    // ("faça um md por fluxograma" ou "escreva os mds", sem dizer "projeto": vale o projeto em uso — o do
+    // quadro ou o último que a pessoa citou nesta conversa —, nunca um palpite)
+    const documentaDesenhos = pedeDocumentacao(q) && (/flu|grama|mapa|desenh|diagram/i.test(q) || Boolean(emUso));
+    const emTodos = pedeEmTodos(q);
+    // "corrija a nota da aba Desktop", "complete o fluxo" (01/11/2026: "peço para ela corrigir e ela não
+    // corrige"): o desenho que a pessoa nomeia ou o do quadro ligado vão para o plano do projeto; com um
+    // desenho avulso aberto no quadro, é dele que ela fala
+    const mudaDesenho = (pedeMudancaNoDesenho(q) || pedeNovoDesenho(q)) && Boolean(vinculado || !quadroAbertoRef.current);
+    if (!citado && !emTodos && !documentaDesenhos && !mudaDesenho) return null;
+    try {
+      if (!projetosRef.current.lista || Date.now() - projetosRef.current.em > 30_000) {
+        projetosRef.current = { em: Date.now(), lista: await apiDosFluxosDaConversa.listar() };
+      }
+      const lista = projetosRef.current.lista || [];
+      const escolha = projetoDoPedido(q, lista, { emUso: ultimoProjetoRef.current, vinculado });
+      if (escolha?.perguntar) return { perguntar: escolha.perguntar };
+      const emUsoNaLista = emUso ? lista.find((p) => p.id === emUso.id) : null;
+      const provavelDoPedido = escolha || ((documentaDesenhos || emTodos) && emUsoNaLista ? { projeto: emUsoNaLista, como: "em uso" } : null);
+      if (!provavelDoPedido) {
+        if (mudaDesenho && !citado) addLog("[PROCESSMAP]", PU, "sem projeto citado: desenho avulso no quadro");
+        return null;
+      }
+      const achado = provavelDoPedido.projeto;
+      const { projeto, fluxos } = await apiDosFluxosDaConversa.lerProjeto(achado.id);
+      ultimoProjetoRef.current = projeto;
+      const doQuadro = quadroVinculoRef.current;
+      const fluxoDoPedido = fluxoCitado(q, fluxos, { nomeDoProjeto: projeto.nome });
+      const provavel = (doQuadro && fluxos.find((f) => f.id === doQuadro.fluxo.id)) || (fluxos.length === 1 ? fluxos[0] : null);
+      addLog("[PROCESSMAP]", PU, `projeto "${projeto.nome}" (${provavelDoPedido.como}): ${fluxos.length} desenho${fluxos.length === 1 ? "" : "s"} lido${fluxos.length === 1 ? "" : "s"}${fluxoDoPedido ? ` · citado: "${fluxoDoPedido.nome}"` : ""}`);
+      return { projeto, fluxos, citado: fluxoDoPedido, provavel, como: provavelDoPedido.como };
+    } catch (err) {
+      addLog("[PROCESSMAP]", OR, `não consegui ler o projeto: ${err.message}`);
+      return null;
+    }
+  };
+
+  // a conversa dos últimos turnos, em texto (vai para o desenho e para o plano)
+  const conversaEmTexto = () => conversaVigente(conversaRef.current).slice(-6)
+    .map((t) => `${t.papel === "lisa" ? "LISA" : "PESSOA"}: ${String(t.texto).slice(0, 1000)}`).join("\n");
+
+  // o plano de um pedido feito sobre um projeto do ProcessMap (src/lib/trabalhoNoProjeto.js): { acao,
+  // explicacao, operacoes }, ou null se o modelo falhou (tenta duas vezes). A janela já mostra a
+  // pergunta enquanto a Lisa planeja.
+  // `imagens`: a tela e os prints da pergunta; `confirmado`: a pessoa já disse "sim" na conversa
+  planejarNoProjetoRef.current = async (q, doProjeto, displayText, { imagens = [], confirmado = false } = {}) => {
+    setQuestion(displayText || q);
+    setAnswer("");
+    setFontes([]);
+    setBusy(true);
+    setMode("listening");
+    for (let tentativa = 1; tentativa <= 2; tentativa++) {
+      try {
+        const plano = await pedirPlano({
+          pedido: q, projeto: doProjeto.projeto, fluxos: doProjeto.fluxos,
+          aberto: quadroVinculoRef.current?.fluxo.id || "", conversa: conversaEmTexto(), imagens, confirmado,
+        });
+        addLog("[PROCESSMAP]", PU, plano.acao === "mudar" ? `plano: ${plano.operacoes.length} desenho${plano.operacoes.length === 1 ? "" : "s"} para mudar ou criar` : "é pergunta sobre o projeto");
+        return plano;
+      } catch (err) {
+        addLog("[PROCESSMAP]", OR, `não consegui planejar (tentativa ${tentativa}): ${err.message}`);
+      }
+    }
+    return null;
+  };
+
+  // executa o plano (src/lib/trabalhoNoProjeto.js): cada operação é um desenho salvo no projeto na
+  // hora; a janela mostra o andamento; o último desenho abre no quadro, ligado.
+  // "a arquitetura do nosso produto": com repositório vinculado, o código dele vai junto (lido uma vez,
+  // num pedido só dele, como na pergunta normal — ver ask acima); "" sem repositório
+  const lerContextoDosRepos = async (q, para = "o desenho") => {
+    if (!reposRef.current.length) return "";
+    addLog("[REPO]", PU, `lendo ${reposRef.current.map((r) => r.repo).join(", ")} para ${para}…`);
+    try {
+      const rr = await fetch("/api/repos/contexto", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repos: reposRef.current, question: q, turnos: conversaVigente(conversaRef.current), images: null }),
+      });
+      const leitura = await rr.json().catch(() => ({}));
+      if (rr.ok && leitura.ok !== false) {
+        setLeituraDosRepos(leitura);
+        return leitura.secao || "";
+      }
+    } catch (err) {
+      addLog("[REPO]", OR, `a leitura do repositório falhou: ${err.message}`);
+    }
+    return "";
+  };
+
+  // Devolve { texto, criados, contexto } — com documentos no plano, a página segue para eles
+  // (documentarNoProjetoRef) sem falar "pronto" antes da hora.
+  trabalharNoProjetoRef.current = async (q, { displayText, doProjeto, plano, imagens = [] }) => {
+    const shown = displayText || q;
+    stopSpeaking();
+    const gen = ++speechGenRef.current;
+    speechEngineRef.current = null;
+    setBusy(true);
+    setDesenhando(true);
+    setQuestion(shown);
+    setFontes([]);
+    setMode("listening");
+    setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: shown }]);
+    const nome = doProjeto.projeto.nome;
+    addLog("[PROCESSMAP]", PU, `trabalhando em "${nome}": ${plano.operacoes.length} desenho${plano.operacoes.length === 1 ? "" : "s"}`);
+    // o fluxo aberto no quadro tem o que a pessoa acabou de mexer: parte dele
+    const abertoId = quadroAbertoRef.current && desenhoRef.current ? quadroVinculoRef.current?.fluxo.id || "" : "";
+    const comDocumentos = plano.documentos?.length > 0;
+    try {
+      const contexto = await lerContextoDosRepos(q);
+      const { linhas, feitos, resultados } = await executarPlano({
+        plano, projeto: doProjeto.projeto, fluxos: doProjeto.fluxos, api: apiDosFluxosDaConversa,
+        conversa: conversaEmTexto(), contexto, abertoId, pedido: q, imagens,
+        docDe: (f) => (f.id === abertoId ? desenhoRef.current : f.documento),
+        aoAndar: (ls) => setAnswer(textoDoAndamento(plano, ls)),
+      });
+      for (const l of linhas) addLog("[PROCESSMAP]", l.ok ? GR : OR, `"${l.nome}": ${l.estado}${l.ok ? "" : ` ${l.nota}`}`);
+      projetosRef.current.em = 0; // a lista mudou
+      ultimoProjetoRef.current = doProjeto.projeto;
+      const ultimo = resultados.at(-1);
+      if (ultimo) {
+        desenhoRef.current = ultimo.doc;
+        setQuadro({
+          versao: { doc: ultimo.doc, chave: `d${Date.now()}`, colecao: ultimo.colecao, mudanca: ultimo.mudou, vinculo: { fluxo: ultimo.fluxo, projeto: doProjeto.projeto } },
+          titulo: ultimo.fluxo.nome, explicacao: ultimo.explicacao,
+        });
+      }
+      const total = plano.operacoes.length;
+      const fim = feitos
+        ? `Salvo no projeto "${nome}" do ProcessMap (${feitos} de ${total})${ultimo ? `; "${ultimo.fluxo.nome}" está aberto no quadro` : ""}.`
+        : `Não consegui mudar nada no projeto "${nome}".`;
+      const texto = textoDoAndamento(plano, linhas, fim);
+      setAnswer(texto);
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: texto }]);
+      conversaRef.current = adicionarTurno(adicionarTurno(conversaVigente(conversaRef.current), "voce", q), "lisa", texto);
+      if (voiceOn && !comDocumentos) enqueueSpeech(feitos ? `Pronto. ${feitos === total ? "Tudo salvo" : `${feitos} de ${total} salvos`} no projeto ${nome}.` : `Não consegui mudar o projeto ${nome}.`, gen);
+      const criados = resultados.filter((r) => !r.mudou).map((r) => ({ ...r.fluxo, documento: r.doc }));
+      return { texto, criados, contexto };
+    } finally {
+      setBusy(false);
+      setDesenhando(false);
+      setMode("idle");
+    }
+  };
+
+  // Mostra o que a Lisa entendeu do pedido sobre o projeto e pergunta "posso fazer?" — nada muda antes do
+  // "sim" (src/lib/processmapNaConversa.js: textoDaConfirmacao, respostaDeConfirmacao).
+  confirmarNoProjetoRef.current = (q, { displayText, doProjeto, plano, imagens = [] }) => {
+    const shown = displayText || q;
+    stopSpeaking();
+    const gen = ++speechGenRef.current;
+    speechEngineRef.current = null;
+    const texto = textoDaConfirmacao(plano, doProjeto.projeto, doProjeto.fluxos, { como: doProjeto.como });
+    planoPendenteRef.current = { q, doProjeto, plano, imagens, em: Date.now() };
+    addLog("[PROCESSMAP]", PU, `esperando o "sim": ${plano.operacoes.length} desenho(s), ${plano.documentos?.length || 0} documento(s) em "${doProjeto.projeto.nome}"`);
+    setQuestion(shown);
+    setAnswer(texto);
+    setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: shown }, { id: `a${Date.now() + 1}`, role: "assistant", text: texto }]);
+    conversaRef.current = adicionarTurno(adicionarTurno(conversaVigente(conversaRef.current), "voce", q), "lisa", texto);
+    setBusy(false);
+    setMode("idle");
+    if (voiceOn) enqueueSpeech(`${plano.explicacao || "Entendi o pedido."} No projeto ${doProjeto.projeto.nome}. Posso fazer?`, gen);
+  };
+
+  // Depois do "sim": lê o projeto de novo (alguém pode ter mexido enquanto a pessoa decidia) e faz.
+  executarPendenteRef.current = async (pendente, shown) => {
+    const { q, plano, imagens = [] } = pendente;
+    let { doProjeto } = pendente;
+    try {
+      const novo = await apiDosFluxosDaConversa.lerProjeto(doProjeto.projeto.id);
+      doProjeto = { ...doProjeto, projeto: novo.projeto, fluxos: novo.fluxos };
+    } catch (err) {
+      addLog("[PROCESSMAP]", OR, `não consegui reler o projeto (sigo com o que li antes): ${err.message}`);
+    }
+    if (plano.acao === "documentar") return documentarNoProjetoRef.current?.(q, { displayText: shown, doProjeto, plano });
+    const feito = await trabalharNoProjetoRef.current?.(q, { displayText: shown, doProjeto, plano, imagens });
+    if (feito && plano.documentos?.length) {
+      return documentarNoProjetoRef.current?.(q, { displayText: shown, doProjeto, plano, criados: feito.criados, antes: feito.texto, contexto: feito.contexto });
+    }
+  };
+
+  // Os .md no editor de código (01/11/2026): os documentos do plano — "um md por fluxograma e mapa
+  // mental" (a visão geral e um por desenho) ou o que o pedido pedir, sobre o assunto dele ("faça um
+  // fluxograma da arquitetura pensando em cibersegurança … e um md também"). Uma aba do editor por
+  // arquivo. Os desenhos só são lidos. `antes`: o que a Lisa acabou de desenhar no mesmo pedido (o texto
+  // do andamento) — aí a vez continua, sem repetir a pergunta; `criados`: os desenhos novos dele.
+  documentarNoProjetoRef.current = async (q, { displayText, doProjeto, plano = null, criados = [], antes = "", contexto = null }) => {
+    const shown = displayText || q;
+    stopSpeaking();
+    const gen = ++speechGenRef.current;
+    speechEngineRef.current = null;
+    setBusy(true);
+    setQuestion(shown);
+    setAnswer(antes);
+    setFontes([]);
+    setMode("listening");
+    if (!antes) setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: shown }]);
+    const { projeto, fluxos } = doProjeto;
+    const pedidos = plano?.documentos?.length ? plano.documentos : documentosPorDesenho(fluxos.filter((f) => f.documento));
+    const andamento = {
+      explicacao: antes ? "Agora os arquivos .md no editor de código:" : plano?.explicacao || `Vou escrever ${pedidos.length === 1 ? "o arquivo .md" : `${pedidos.length} arquivos .md`} no editor de código, sem mexer em nenhum desenho.`,
+    };
+    const comAntes = (t) => (antes ? `${antes}\n\n${t}` : t);
+    addLog("[PROCESSMAP]", PU, `documentando "${projeto.nome}": ${pedidos.map((d) => d.arquivo).join(", ")}`);
+    try {
+      const { linhas, documentos } = await escreverDocumentos({
+        pedido: q, projeto, fluxos, documentos: pedidos, criados, conversa: conversaEmTexto(),
+        contexto: contexto ?? await lerContextoDosRepos(q, "os documentos"),
+        aoAndar: (ls) => setAnswer(comAntes(textoDoAndamento(andamento, ls))),
+      });
+      for (const l of linhas) addLog("[PROCESSMAP]", l.ok ? GR : OR, `${l.nome}: ${l.estado}${l.ok ? "" : ` ${l.nota}`}`);
+      ultimoProjetoRef.current = projeto;
+      const falharam = linhas.filter((l) => l.ok === false).map((l) => l.nome);
+      const nomes = documentos.map((d) => d.arquivo.split("/").pop()).join(", ");
+      const intro = documentos.length
+        ? `Escrevi ${documentos.length === 1 ? `o arquivo ${nomes}` : `${documentos.length} arquivos .md (${nomes})`} no editor de código${documentos.length > 1 ? ", um por aba" : ""}.${antes ? "" : " Nenhum desenho foi mudado."}${falharam.length ? `\n\nNão consegui escrever: ${falharam.join(", ")} — peça de novo que eu tento só esses.` : ""}`
+        : `Não consegui escrever ${pedidos.length === 1 ? "o documento" : "os documentos"} agora (${linhas.find((l) => l.nota)?.nota || "erro"}).${antes ? "" : " Nenhum desenho foi mudado."}`;
+      const texto = respostaComDocumentos(intro, documentos);
+      if (documentos.length) guardarNaIde(abrirNaIde(shown), shown, texto);
+      setAnswer(comAntes(texto));
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: texto }]);
+      conversaRef.current = adicionarTurno(adicionarTurno(conversaVigente(conversaRef.current), "voce", q), "lisa", intro);
+      if (voiceOn) enqueueSpeech(documentos.length ? `Pronto.${antes ? " Desenhei e" : ""} escrevi ${documentos.length === 1 ? "o documento" : `${documentos.length} documentos`} no editor de código.` : `Não consegui escrever os documentos agora.`, gen);
+    } finally {
+      setBusy(false);
+      setMode("idle");
+    }
+  };
+
+  desenharNaTelaRef.current = async (q, { displayText, mudar = false, doProjeto = null, imagens = [] } = {}) => {
+    const shown = displayText || q;
+    stopSpeaking();
+    const gen = ++speechGenRef.current;
+    speechEngineRef.current = null;
+    setBusy(true);
+    setDesenhando(true);
+    setQuestion(shown);
+    setAnswer("");
+    setFontes([]);
+    setMode("listening");
+    setMessages((m) => [...m, { id: `u${Date.now()}`, role: "user", text: shown }]);
+    addLog("[QUADRO]", PU, quadroAbertoRef.current ? "mudando o desenho…" : "desenhando o processo…");
+    const conversa = conversaVigente(conversaRef.current).slice(-6)
+      .map((t) => `${t.papel === "lisa" ? "LISA" : "PESSOA"}: ${String(t.texto).slice(0, 1000)}`).join("\n");
+    try {
+      // "desenhe essa arquitetura": com um repositório vinculado, o código dele vai junto
+      const contexto = await lerContextoDosRepos(q);
+      // no projeto: parte do fluxo-alvo (o do quadro, se for ele que está aberto: tem o que a pessoa
+      // acabou de mexer); sem projeto, do que está no quadro
+      const alvo = doProjeto?.alvo || null;
+      const alvoAberto = Boolean(alvo && quadroVinculoRef.current?.fluxo.id === alvo.id && quadroAbertoRef.current && desenhoRef.current);
+      const atual = alvo ? (alvoAberto ? desenhoRef.current : alvo.documento) : mudar && quadroAbertoRef.current ? desenhoRef.current : null;
+      const res = await fetch("/api/diagrama", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ pedido: q, atual, conversa, contexto, projeto: doProjeto?.texto || "", ...(imagens.length ? { imagens } : {}) }),
+      });
+      const r = await res.json().catch(() => ({}));
+      if (!res.ok || !r.ok) throw new Error(r.error || `HTTP ${res.status}`);
+      // o que mudou DE VERDADE (src/lib/diagramaDaLisa.js: resumoDaMudanca) — e não só o que o modelo diz
+      const mudancaReal = atual ? resumoDaMudanca(atual, r.doc) : null;
+      if (mudancaReal && !mudancaReal.mudou) {
+        const texto = "Não mudei nada: o desenho voltou igual. Diga o que está errado e onde — a aba, a etapa ou a nota, pelo texto que aparece nela — que eu corrijo.";
+        addLog("[QUADRO]", OR, "o desenho voltou igual — nada foi mudado nem salvo");
+        setAnswer(texto);
+        setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: texto }]);
+        conversaRef.current = adicionarTurno(adicionarTurno(conversaVigente(conversaRef.current), "voce", q), "lisa", texto);
+        if (voiceOn) enqueueSpeech(texto, gen);
+        return;
+      }
+      desenhoRef.current = r.doc;
+      // no projeto: salva lá (o fluxo-alvo ganha a versão nova; sem alvo, nasce um fluxo no projeto) e
+      // o quadro abre ligado a ele (`vinculo`: o que mudar depois também é salvo)
+      let vinculo = null;
+      let aviso = "";
+      if (doProjeto) {
+        try {
+          if (alvo) {
+            // (origem "lisa": a versão de antes fica guardada — dá para voltar pelo painel ProcessMap)
+            const daLisa = { documento: r.doc, origem: "lisa", motivo: q.replace(/\s+/g, " ").slice(0, 140) };
+            const fluxo = await apiDosFluxosDaConversa.salvar(alvo.id, alvoAberto ? { ...daLisa, forcar: true } : { ...daLisa, versao: alvo.versao });
+            vinculo = { fluxo, projeto: doProjeto.projeto };
+          } else {
+            vinculo = await apiDosFluxosDaConversa.criar({ documento: r.doc, nome: r.titulo, projetoId: doProjeto.projeto.id, origem: "lisa" });
+          }
+          projetosRef.current.em = 0; // a lista mudou
+          addLog("[PROCESSMAP]", GR, `salvo em "${vinculo.projeto.nome}" → "${vinculo.fluxo.nome}"`);
+        } catch (err) {
+          aviso = err.status === 409
+            ? ` Não salvei no projeto: o fluxo "${alvo?.nome}" foi mudado em outro lugar agora há pouco — o desenho ficou só no quadro.`
+            : ` Não consegui salvar no projeto (${err.message}); o desenho ficou só no quadro.`;
+          addLog("[PROCESSMAP]", OR, aviso.trim());
+        }
+      }
+      // `mudanca`: é o mesmo desenho, mudado — se ele foi salvo num projeto, o quadro grava a mudança
+      const mudanca = Boolean(mudar && quadroAbertoRef.current);
+      setQuadro({ versao: { doc: r.doc, chave: `d${Date.now()}`, colecao: r.colecao, mudanca, vinculo }, titulo: r.titulo, explicacao: r.explicacao });
+      const salvoNoProjeto = vinculo ? ` ${alvo ? "Atualizei" : "Salvei"} "${vinculo.fluxo.nome}" no projeto "${vinculo.projeto.nome}" do ProcessMap.` : "";
+      // desenho NOVO sem projeto citado: avulso, e quem decide onde guardar é a pessoa (BEYOND-0013)
+      const avulso = !doProjeto && !mudanca ? "\n\nFicou avulso, fora de projeto. Para guardar, toque em 💾 salvar no quadro: num projeto que já existe ou num novo." : "";
+      // o que a pessoa listou e não entrou nem na segunda tentativa: dito, e não escondido
+      const faltou = r.faltando?.length ? `\n\nNão achei no desenho: ${r.faltando.slice(0, 8).map((i) => `"${i}"`).join(", ")}. Se faltou, me diga onde entra.` : "";
+      const texto = `${r.explicacao || `Desenhei "${r.titulo}" no quadro.`}${mudancaReal ? `\n\nO que mudou: ${mudancaReal.texto}.` : ""}${salvoNoProjeto}${aviso}${avulso}${faltou}`;
+      setAnswer(texto);
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: texto }]);
+      conversaRef.current = adicionarTurno(adicionarTurno(conversaVigente(conversaRef.current), "voce", q), "lisa", texto);
+      addLog("[QUADRO]", GR, `${r.titulo}: ${r.doc?.pages?.[0]?.shapes?.length || 0} formas`);
+      if (voiceOn) enqueueSpeech(texto, gen);
+    } catch (err) {
+      const texto = `Não consegui desenhar agora: ${err.message}`;
+      addLog("[ERR]", OR, err.message);
+      setAnswer(texto);
+      setMessages((m) => [...m, { id: `a${Date.now()}`, role: "assistant", text: texto }]);
+    } finally {
+      setBusy(false);
+      setDesenhando(false);
+      setMode("idle");
+    }
+  };
+
+  // O "sim" ao "Posso fazer?" da conversa comum (02/11/2026): o pedido que ela entendeu vai, agora de
+  // verdade, para o caminho do desenho. Sobre um projeto do ProcessMap, o plano já sabe que a pessoa
+  // confirmou (não volta como pergunta) e é feito sem perguntar de novo; sem projeto, desenha no quadro
+  // — mudando o desenho aberto quando o pedido era mudar, senão um desenho novo.
+  fazerDesenhoConfirmadoRef.current = async (pendente, shown) => {
+    const { q, imagens = [] } = pendente;
+    // ("em qual projeto?" já foi perguntado na vez do pedido; aqui, sem a resposta, o desenho sai avulso)
+    const resolvido = await resolverProjetoRef.current?.(q);
+    const doProjeto = resolvido?.perguntar ? null : resolvido;
+    if (doProjeto) {
+      const plano = await planejarNoProjetoRef.current?.(q, doProjeto, shown, { imagens, confirmado: true });
+      if (plano?.acao === "mudar" || plano?.acao === "documentar") return executarPendenteRef.current?.({ q, doProjeto, plano, imagens }, shown);
+      doProjeto.alvo = null;
+      doProjeto.texto = contextoDoProjeto(doProjeto.projeto, doProjeto.fluxos);
+    }
+    const quadroComDesenho = quadroAbertoRef.current && Boolean(desenhoRef.current);
+    const mudar = !doProjeto && quadroComDesenho
+      && (pedidoDeDesenho(q, { quadroAberto: true }) === "alterar" || (pedeMudancaNoDesenho(q) && !pedeNovoDesenho(q)));
+    return desenharNaTelaRef.current?.(q, { displayText: shown, mudar, doProjeto, imagens });
+  };
+
+  // a barra "pedir à Lisa" da IDE (BEYOND-0009): a pergunta leva o código da aba; a resposta é
+  // digitada como sempre e, no fim, escrita em cima da aba de onde o pedido saiu
+  const pedirNaIde = useCallback(({ pedido, nome, linguagem, codigo, alvo }) => {
+    const q = `${pedido}\n\nO código está na IDE, na aba "${nome}". Se for mudar o código, devolva a versão COMPLETA dele num bloco só (ela vai substituir o que está na aba):\n\`\`\`${linguagem || ""} ${nome}\n${codigo}\n\`\`\``;
+    askRef.current?.(q, { displayText: `${pedido}  ·  ⌨ ${nome}`, alvoDaIde: alvo });
+  }, []);
+
+  // ---- Modo Escuta por palavra: "Lisa, ..." ----
+  //
+  // O microfone fica aberto o tempo todo, mas nada acontece até a palavra de acordar. A
+  // decisão do que fazer com o que foi dito mora em src/lib/escutaPorPalavra.js, testada por
+  // `npm run escuta-check` — aqui fica só o que precisa do navegador: o microfone, o laço que
+  // religa o reconhecimento e a ligação com o rádio.
+  //
+  // Feito para ficar aberto NO SERVIDOR LOCAL, que é quem tem o microfone e as caixas de som.
+  const ESCUTA_JANELA_MS = 8000; // quanto ela espera o comando depois de ouvir só "Lisa"
+
+  useEffect(() => {
+    if (!escutaPalavra) { setEscutaEstado("dormindo"); return; }
+    if (typeof window === "undefined") return;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      addLog("[ESCUTA]", OR, "este navegador não reconhece fala — use o Chrome ou o Edge");
+      setEscutaPalavra(false);
+      return;
+    }
+
+    let parado = false;
+    let rec = null;
+    let religar = null;
+    let acordadaAte = 0;
+    // Enquanto ela responde, o microfone fica fechado de propósito — e `onend` não pode
+    // religá-lo por conta própria, senão haveria dois reconhecimentos abertos ao mesmo tempo.
+    let processando = false;
+
+    // Um bip curto ao acordar. Parece enfeite e não é: sem retorno nenhum, a pessoa não sabe
+    // se foi ouvida e fala de novo por cima — que é justamente quando o reconhecimento erra.
+    const bip = () => {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator(), vol = ctx.createGain();
+        osc.frequency.value = 880; vol.gain.value = 0.06;
+        osc.connect(vol); vol.connect(ctx.destination);
+        osc.start(); osc.stop(ctx.currentTime + 0.09);
+        setTimeout(() => ctx.close().catch(() => {}), 300);
+      } catch { /* sem áudio disponível — o modo continua funcionando, só mais mudo */ }
+    };
+
+    const tocar = async (alvo) => {
+      // Mesma rota que o laço do rádio usa. `getRadioPlaylist` lê o arquivo em tempo de build
+      // e não existe no navegador — chamá-la aqui daria ReferenceError em execução, sem o
+      // build reclamar de nada.
+      let lista = radioPlaylistRef.current;
+      if (!lista?.length) {
+        try {
+          const res = await fetch("/api/radio/playlist");
+          const data = await res.json();
+          lista = data?.ok ? data.playlist : [];
+          radioPlaylistRef.current = lista; // o rádio reaproveita quando for ligado
+        } catch { lista = []; }
+      }
+      const musica = alvo ? escolherMusica(alvo, lista) : null;
+
+      if (alvo && !musica) {
+        // Dizer "não achei" é melhor que tocar outra coisa: duas escolhas erradas e ninguém
+        // mais confia no modo. A playlist é o arquivo radio/playlist.txt, editado à mão.
+        addLog("[ESCUTA]", OR, `não achei "${alvo}" na playlist`);
+        await speakText(`Não achei ${alvo} na playlist.`, { voiceName: voiceNameForScreenRef.current }).catch(() => {});
+        return;
+      }
+      if (musica) {
+        pedidoDeMusicaRef.current = musica;
+        addLog("[ESCUTA]", PU, `pedido: ${musica.title}`);
+      }
+      if (!radioMode) setRadioMode(true);
+      else radioSkipRef.current?.(); // já estava tocando: pula para o pedido agora
+    };
+
+    const responder = async (dito) => {
+      const cmd = interpretarComando(dito);
+      addLog("[ESCUTA]", PU, `"${dito}" → ${cmd.tipo}`);
+      if (cmd.tipo === "parar") { stopSpeaking(); setRadioMode(false); return; }
+      if (cmd.tipo === "pular") { radioSkipRef.current?.(); return; }
+      if (cmd.tipo === "tocar") return tocar(cmd.alvo);
+      if (cmd.tipo === "perguntar") return askRef.current?.(cmd.texto);
+    };
+
+    const iniciar = () => {
+      if (parado) return;
+      rec = new SR();
+      rec.lang = "pt-BR";
+      rec.continuous = true;
+      rec.interimResults = false;
+
+      rec.onresult = async (ev) => {
+        if (parado) return;
+        const dito = ev.results[ev.results.length - 1]?.[0]?.transcript || "";
+        if (!dito.trim()) return;
+
+        const janelaAberta = Date.now() < acordadaAte;
+        const { acordou, resto } = detectarAcordar(dito);
+        if (!acordou && !janelaAberta) return; // conversa normal da casa — ignora
+
+        const comando = acordou ? resto : normalizar(dito);
+        if (!comando) {
+          // Ouviu só "Lisa": abre a janela e espera a próxima frase.
+          acordadaAte = Date.now() + ESCUTA_JANELA_MS;
+          setEscutaEstado("acordada");
+          bip();
+          // Sem isto o rótulo fica em "ouvindo o comando…" para sempre quando ninguém
+          // completa a frase — e aí não dá para saber se ela ainda está esperando algo.
+          setTimeout(() => { if (!parado && Date.now() >= acordadaAte) setEscutaEstado("dormindo"); }, ESCUTA_JANELA_MS + 200);
+          return;
+        }
+
+        acordadaAte = 0;
+        setEscutaEstado("ocupada");
+        if (acordou) bip();
+
+        // Fecha o microfone enquanto ela responde e fala, senão ela se escuta e se interrompe.
+        processando = true;
+        try { rec?.stop(); } catch { /* já parado */ }
+        try {
+          await responder(comando);
+          await speechQueueRef.current?.catch?.(() => {}); // espera a fala terminar de tocar
+        } catch (err) {
+          addLog("[ESCUTA]", OR, `falhou: ${err?.message || err}`);
+        }
+        processando = false;
+        if (!parado) { setEscutaEstado("dormindo"); iniciar(); }
+      };
+
+      rec.onerror = (ev) => {
+        // `no-speech` e `aborted` são rotina num microfone que fica aberto o dia todo; só
+        // valem log os erros que realmente impedem de ouvir.
+        if (ev?.error && !["no-speech", "aborted"].includes(ev.error)) {
+          addLog("[ESCUTA]", OR, `reconhecimento: ${ev.error}`);
+        }
+      };
+
+      // O reconhecimento do Chrome desiste sozinho de tempos em tempos, sem erro nenhum. Sem
+      // este religa, o modo morre calado depois de alguns minutos e não há como saber por quê.
+      //
+      // A condição é `!processando`, e não "a janela de comando está fechada" como escrevi
+      // primeiro: com aquela, ouvir só "Lisa" abria a janela e então o religa era justamente
+      // o que NÃO acontecia — ela ficaria esperando um comando de microfone fechado.
+      rec.onend = () => { if (!parado && !processando) religar = setTimeout(iniciar, 400); };
+
+      try { rec.start(); } catch { /* já estava rodando */ }
+    };
+
+    addLog("[ESCUTA]", PU, "ouvindo — diga \"Lisa\" e o comando");
+    iniciar();
+
+    return () => {
+      parado = true;
+      clearTimeout(religar);
+      try { rec?.stop(); } catch { /* já parado */ }
+      setEscutaEstado("dormindo");
+    };
+  }, [escutaPalavra, radioMode, addLog, stopSpeaking]);
+
+  // ---- Modo conversa (BEYOND-0006) ----
+  //
+  // Microfone aberto o tempo todo, como na escuta por palavra, mas sem precisar dizer "Lisa":
+  // cada frase vira uma pergunta que CONTINUA a conversa (conversaRef vai junto). No silêncio,
+  // nada acontece. Enquanto ela responde e fala, o reconhecimento fica fechado — senão ela se
+  // ouve e responde a si mesma — e reabre quando a fala termina. Funciona junto com a Tela e a
+  // Observância: ask() já manda o retrato delas em cada pergunta.
+  useEffect(() => {
+    if (!conversaAberta) { setConversaEstado("desligada"); return; }
+    if (typeof window === "undefined") return;
+
+    let parado = false;
+    // o áudio da fala conta enquanto toca de verdade: um <audio> parado não é ela falando (BEYOND-0011)
+    const tocandoAgora = () => { const a = audioRef.current; return Boolean(a && !a.paused && !a.ended); };
+    const falandoAgora = () => tocandoAgora() || isBrowserVoiceAudioPlaying() || window.speechSynthesis?.speaking;
+    const fimDaFalaDela = (parou) => esperarAFalaAcabar({ fila: () => speechQueueRef.current, falando: falandoAgora, parou });
+
+    // No CELULAR a conversa escuta gravando (src/lib/conversaPorGravacao.js, BEYOND-0011): o reconhecimento
+    // do navegador com o microfone da esfera aberto derrubava a escuta no Android, e a conversa parava.
+    // Sem interromper por "Lisa" (seria um segundo microfone): ela termina de falar e a escuta volta.
+    if (isMobile) {
+      let conversa = null;
+      addLog("[CONVERSA]", PU, "conversa aberta (celular: gravando) — pode falar quando quiser");
+      abrirConversaPorGravacao({
+        aoEstado: (e) => { if (!parado) setConversaEstado(e === "ouvindo" ? "ouvindo" : "respondendo"); },
+        aoAviso: (t) => addLog("[CONVERSA]", OR, t),
+        aoMotor: ({ motor, aviso }) => addLog("[CONVERSA]", aviso ? OR : GR, `transcrito por ${motor === "groq" ? "Whisper (Groq)" : "Gemini"}${aviso ? ` — ${aviso}` : ""}`),
+        aoTexto: async (texto) => {
+          if (parado) return;
+          addLog("[CONVERSA]", CY, `→ "${texto}"`);
+          await askRef.current?.(texto);
+          await fimDaFalaDela(() => parado);
+        },
+      })
+        .then((c) => { if (parado) c.fechar(); else conversa = c; })
+        .catch((err) => { addLog("[CONVERSA]", OR, dicaDoErro(err)); setConversaAberta(false); });
+      return () => {
+        parado = true;
+        conversa?.fechar();
+        setConversaEstado("desligada");
+      };
+    }
+
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      addLog("[CONVERSA]", OR, "este navegador não reconhece fala — use o Chrome ou o Edge");
+      setConversaAberta(false);
+      return;
+    }
+
+    let rec = null;
+    let religar = null;
+    let processando = false;
+    let ultimaFalaEm = 0;
+    // Uma fala dela que termina gera, às vezes, um "resultado" atrasado com as próprias palavras
+    // dela: o que chega até 1,2 s depois de ela parar de falar é eco, não você.
+    const vigia = setInterval(() => { if (falandoAgora()) ultimaFalaEm = Date.now(); }, 200);
+    abrirMicrofone(); // só para a esfera medir o volume da sua voz
+
+    // INTERROMPER: enquanto ela fala, um segundo reconhecimento fica atento só à palavra "Lisa".
+    // Ouviu → ela para NA HORA (a fala inteira, não só o pedaço tocando) e espera o resto da sua
+    // frase; "Lisa, não é esse, é o de vendas" já vira a próxima pergunta. Eco da própria voz dela
+    // (um trecho da fala que contém "Lisa") é ignorado — ver interrupcaoNaFala em conversa.js.
+    // Devolve { interrompida, resto } quando a fala acaba ou quando você a interrompe.
+    const ESPERA_PELA_CORRECAO_MS = 4000;
+    let ouvidoAtivo = null; // o reconhecimento da interrupção, para a limpeza do efeito fechar
+    const vigiarInterrupcao = () => new Promise((resolve) => {
+      const textoDela = ultimaRespostaRef.current || "";
+      let fim = false;
+      let interrompendo = false;
+      let ouvido = null;
+      let prazo = null;
+      const terminar = (r) => {
+        if (fim) return;
+        fim = true;
+        clearTimeout(prazo);
+        try { ouvido?.abort(); } catch { /* já parado */ }
+        if (ouvidoAtivo === ouvido) ouvidoAtivo = null;
+        resolve(r);
+      };
+      // a fala acabou sozinha: a fila inteira (pedaços que entram depois também) e o áudio tocando.
+      // Parar por interrupção também esvazia a fila — aí quem termina é o vigia, não isto.
+      // (com teto: um áudio que nunca termina não prende a conversa — BEYOND-0011)
+      (async () => {
+        await fimDaFalaDela(() => parado || interrompendo);
+        if (!interrompendo) terminar({ interrompida: false, resto: "" });
+      })();
+      const calar = () => {
+        interrompendo = true;
+        speechGenRef.current++; // os próximos pedaços desta resposta não tocam mais
+        stopSpeaking();
+        playListenBeep();
+        prazo = setTimeout(() => terminar({ interrompida: true, resto: "" }), ESPERA_PELA_CORRECAO_MS);
+      };
+      const abrir = () => {
+        if (fim || parado) return terminar({ interrompida: interrompendo, resto: "" });
+        ouvido = new SR();
+        ouvidoAtivo = ouvido;
+        ouvido.lang = "pt-BR";
+        ouvido.continuous = true;
+        ouvido.interimResults = true; // a palavra vem num resultado parcial: para antes de você terminar
+        ouvido.onresult = (ev) => {
+          for (let i = ev.resultIndex; i < ev.results.length; i++) {
+            const r = interrupcaoNaFala(ev.results[i][0].transcript, textoDela);
+            if (!r.interrompe) continue;
+            if (!interrompendo) { calar(); addLog("[CONVERSA]", PU, "interrompida — pode falar"); }
+            // a frase fechou: o que veio depois de "Lisa" é a correção
+            if (ev.results[i].isFinal) return terminar({ interrompida: true, resto: r.resto });
+          }
+        };
+        ouvido.onerror = () => { /* no-speech/aborted são rotina aqui */ };
+        ouvido.onend = () => { if (!fim) setTimeout(abrir, 150); };
+        try { ouvido.start(); } catch { /* já rodando */ }
+      };
+      abrir();
+    });
+
+    const iniciar = () => {
+      if (parado) return;
+      rec = new SR();
+      rec.lang = "pt-BR";
+      rec.continuous = true;
+      rec.interimResults = false;
+      rec.onresult = async (ev) => {
+        if (parado || processando) return;
+        const dito = corrigirNomeDaLisa((ev.results[ev.results.length - 1]?.[0]?.transcript || "").trim());
+        if (!falaQueValePergunta(dito)) return;
+        if (falandoAgora() || Date.now() - ultimaFalaEm < 1200) return; // eco dela mesma
+        processando = true;
+        setConversaEstado("respondendo");
+        try { rec?.stop(); } catch { /* já parado */ }
+        addLog("[CONVERSA]", CY, `→ "${dito}"`);
+        try {
+          let pergunta = dito;
+          while (pergunta && !parado) {
+            await askRef.current?.(pergunta);
+            pergunta = null;
+            const r = await vigiarInterrupcao(); // espera a fala terminar — ou você dizer "Lisa"
+            if (r.interrompida) {
+              conversaRef.current = marcarInterrompida(conversaRef.current);
+              if (r.resto && falaQueValePergunta(r.resto)) { pergunta = r.resto; addLog("[CONVERSA]", CY, `→ "${r.resto}"`); }
+            }
+          }
+          await fimDaFalaDela(() => parado); // e qualquer outra fala dela
+        } catch (err) {
+          addLog("[CONVERSA]", OR, `falhou: ${err?.message || err}`);
+        }
+        processando = false;
+        if (!parado) { setConversaEstado("ouvindo"); iniciar(); }
+      };
+      rec.onerror = (ev) => {
+        if (ev?.error && !["no-speech", "aborted"].includes(ev.error)) addLog("[CONVERSA]", OR, `reconhecimento: ${ev.error}`);
+      };
+      // o reconhecimento do Chrome desiste sozinho de tempos em tempos: religa calado
+      rec.onend = () => { if (!parado && !processando) religar = setTimeout(iniciar, 300); };
+      try { rec.start(); setConversaEstado("ouvindo"); } catch { /* já estava rodando */ }
+    };
+
+    addLog("[CONVERSA]", PU, "conversa aberta — pode falar quando quiser");
+    iniciar();
+    return () => {
+      parado = true;
+      clearTimeout(religar);
+      clearInterval(vigia);
+      try { rec?.stop(); } catch { /* já parado */ }
+      try { ouvidoAtivo?.abort(); } catch { /* já parado */ }
+      fecharMicrofone();
+      setConversaEstado("desligada");
+    };
+  }, [conversaAberta, isMobile, addLog, stopSpeaking]);
+
+  // ---- STT: ouvir microfone (Web Speech API) ----
+  const toggleMic = useCallback(() => {
+    // Com a conversa aberta o microfone já está ouvindo: o botão serve para encerrá-la.
+    if (conversaAbertaRef.current) { setConversaAberta(false); return; }
+    if (typeof window === "undefined") return;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { setVoiceSupported(false); addLog("[VOICE]", OR, "navegador sem suporte a microfone"); return; }
+
+    // se já está ouvindo, para
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+      setListening(false);
+      return;
+    }
+
+    stopSpeaking(); // não ouvir enquanto fala
+    const rec = new SR();
+    rec.lang = "pt-BR";
+    rec.interimResults = true;
+    rec.continuous = false;
+    recognitionRef.current = rec;
+
+    let finalText = "";
+    rec.onstart = () => { setListening(true); addLog("[VOICE]", GR, "ouvindo…"); abrirMicrofone(); };
+    rec.onresult = (e) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t;
+        else interim += t;
+      }
+      setInput(finalText || interim);
+    };
+    rec.onerror = (e) => { addLog("[VOICE]", OR, `mic: ${e.error}`); };
+    rec.onend = () => {
+      setListening(false);
+      fecharMicrofone();
+      recognitionRef.current = null;
+      const q = corrigirNomeDaLisa((finalText || "").trim());
+      if (q) { addLog("[VOICE]", CY, `→ "${q}"`); setInput(""); ask(q); }
+      else addLog("[VOICE]", OR, "nada capturado");
+    };
+    rec.start();
+  }, [addLog, ask, stopSpeaking]);
+  toggleMicForGestureRef.current = toggleMic;
+  // (no celular, o microfone de segurar é o MicrofoneDaLisa: grava o áudio de verdade, como o
+  // WhatsApp — o reconhecimento do navegador falhava lá; ver src/lib/falaComoWhatsApp.js)
+
+  // modo chat (mobile): rola pro fim sempre que a conversa cresce ou a resposta vai chegando
+  useEffect(() => {
+    if (!isMobile || mobileView !== "chat") return;
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [isMobile, mobileView, messages, answer]);
+
+  const meta = MODE_META[mode];
+  // o código da resposta vai para o editor (IdeDaLisa); aqui fica só o aviso no lugar dele
+  const transcript =
+    mode === "speaking" || answer
+      ? respostaSemCodigo(answer) || "…"
+      : mode === "listening"
+      ? `"${question}"`
+      : 'Standby. Digite uma pergunta abaixo e pressione Enter. Eu sou a Lisa.';
+
+  // Janela flutuante e arrastável do Modo Código — sobreposta, mostra o ESTÁGIO atual (não só
+  // a última frase dita), o código sendo escrito e qualquer erro. Compartilhada entre o
+  // layout mobile e desktop (os dois têm `return` próprios abaixo, então isso vira uma
+  // variável renderizada nos dois em vez de duplicar o JSX inteiro duas vezes).
+  const codeFilesOpen = [...liveCodeDone, ...(liveCode ? [liveCode] : [])];
+  const codeActivePath = codeActiveTab && codeFilesOpen.some((f) => f.path === codeActiveTab)
+    ? codeActiveTab
+    : (liveCode ? liveCode.path : codeFilesOpen[codeFilesOpen.length - 1]?.path) || null;
+  const codeActiveFile = codeFilesOpen.find((f) => f.path === codeActivePath) || null;
+  const codeActiveTail = codeActiveFile ? codeActiveFile.content.slice(-6000) : "";
+  const codeActiveLang = codeActiveFile ? langForPath(codeActiveFile.path) : null; // null = extensão sem gramática reconhecida, cai pro texto puro
+  // paleta do realce de sintaxe — cores do próprio app (CY/PU/GR/OR + o texto
+  // cyan-esbranquiçado de sempre), não a paleta padrão do Prism nem do VS Code.
+  const BB_CODE_THEME = {
+    plain: { color: "#cfeffb" },
+    styles: [
+      { types: ["comment", "prolog", "doctype", "cdata"], style: { color: "rgba(207,239,251,0.35)", fontStyle: "italic" } },
+      { types: ["string", "attr-value", "char", "inserted"], style: { color: GR } },
+      { types: ["keyword", "tag", "important", "atrule", "deleted"], style: { color: PU } },
+      { types: ["function", "class-name", "selector"], style: { color: CY } },
+      { types: ["number", "boolean", "constant", "regex", "symbol"], style: { color: OR } },
+      { types: ["punctuation", "operator"], style: { color: "rgba(207,239,251,0.55)" } },
+      { types: ["property", "attr-name"], style: { color: "rgba(207,239,251,0.85)" } },
+      { types: ["variable", "parameter", "builtin"], style: { color: "#eafcff" } },
+    ],
+  };
+  const codeModeLog = messages.filter((m) => m.codeMode); // histórico só do Modo Código, pra caber inteiro na janela sem misturar com o chat normal
+  const submitCodeModalInput = () => {
+    const q = codeModalInput.trim();
+    if (!q || busy) return;
+    setCodeModalInput("");
+    askCodeMode(q);
+  };
+
+  // Editor das respostas com código, em qualquer modo (o Modo Código tem a janela dele, acima):
+  // uma janela só para a conversa inteira, uma aba por resposta — a que está chegando entra viva.
+  mensagensRef.current = messages;
+  const ideDaLisa = !codeMode && (
+    <IdeDaLisa
+      interacoes={ideViva ? [...ideHistorico, { ...ideViva, texto: answer }] : ideHistorico} chegando={busy}
+      aoPedir={pedirNaIde} aoMudarCodigo={(texto) => { codigoDaIdeRef.current = texto; }}
+      aoDesenhar={(codigo, nome) => desenharNaTelaRef.current?.(`Desenhe no quadro este diagrama:\n${codigo}`, { displayText: `◇ desenhar no quadro: ${nome}` })}
+    />
+  );
+  // o quadro da Lisa (BEYOND-0010): aparece quando ela desenha; o que a pessoa mexe volta para cá
+  const quadroDaLisa = quadro && (
+    <QuadroDaLisa
+      versao={quadro.versao} titulo={quadro.titulo} explicacao={quadro.explicacao} ocupado={desenhando}
+      aoMudar={(doc) => { desenhoRef.current = doc; }}
+      aoPedir={(p) => desenharNaTelaRef.current?.(p, { mudar: true })}
+      aoVincular={(r) => { quadroVinculoRef.current = r; if (r?.projeto) ultimoProjetoRef.current = r.projeto; }}
+      aoFechar={() => { setQuadro(null); desenhoRef.current = null; quadroVinculoRef.current = null; }}
+    />
+  );
+
+  const codeTaskModal = codeModalOpen && (
+    <div
+      style={{
+        position: "fixed", left: codeModalMaximized ? "3vw" : codeModalPos.x, top: codeModalMaximized ? "5vh" : codeModalPos.y,
+        zIndex: 200, width: codeModalMaximized ? "94vw" : `min(92vw, ${codeModalSize.width}px)`,
+        height: codeModalMinimized ? "auto" : (codeModalMaximized ? "88vh" : `min(80vh, ${codeModalSize.height}px)`),
+        display: "flex", flexDirection: "column", overflow: "hidden",
+        background: "#050b10", border: "1px solid rgba(var(--accent-rgb),0.28)", borderRadius: 10,
+        boxShadow: "0 20px 60px rgba(0,0,0,0.65), 0 0 0 1px rgba(0,0,0,0.4)",
+        ...mono,
+      }}
+    >
+      {/* barra de título — arrastável, com bolinhas de fechar/minimizar/maximizar (a função é
+          universal; as cores ficam discretas pra não destoar do resto do app) */}
+      <div
+        onPointerDown={onCodeModalDragStart}
+        onDoubleClick={() => setCodeModalMaximized((v) => !v)}
+        style={{
+          display: "flex", alignItems: "center", gap: 10, padding: "8px 12px",
+          background: "rgba(0,0,0,0.4)", borderBottom: "1px solid rgba(var(--accent-rgb),0.18)",
+          cursor: codeModalMaximized ? "default" : "grab", userSelect: "none", flex: "none",
+        }}
+      >
+        <div style={{ display: "flex", gap: 7, flex: "none" }}>
+          <span
+            onClick={(e) => { e.stopPropagation(); setCodeModalOpen(false); }}
+            title="fechar" style={{ width: 11, height: 11, borderRadius: "50%", background: OR, cursor: "pointer", opacity: 0.75 }}
+          />
+          <span
+            onClick={(e) => { e.stopPropagation(); setCodeModalMinimized((v) => !v); }}
+            title="minimizar" style={{ width: 11, height: 11, borderRadius: "50%", background: "rgba(207,239,251,0.4)", cursor: "pointer" }}
+          />
+          <span
+            onClick={(e) => { e.stopPropagation(); setCodeModalMaximized((v) => !v); }}
+            title="maximizar" style={{ width: 11, height: 11, borderRadius: "50%", background: GR, cursor: "pointer", opacity: 0.75 }}
+          />
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flex: 1, justifyContent: "center" }}>
+          <span style={{ fontSize: 10.5, letterSpacing: 1.5, color: PU, flex: "none" }}>🛠️ MODO CÓDIGO</span>
+          <span style={{ fontSize: 9.5, color: codeStage === "error" ? OR : codeStage === "done" ? GR : "rgba(207,239,251,0.55)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            — {codeStage ? CODE_STAGE_LABELS[codeStage] : "aguardando…"}
+          </span>
+        </div>
+        <div style={{ width: 54, flex: "none", display: "flex", justifyContent: "flex-end" }}>
+          {!!codeSession && (
+            <span
+              onClick={(e) => { e.stopPropagation(); setCodeSession(null); }}
+              title="começar uma tarefa nova (branch e PR novos), em vez de continuar nesta"
+              style={{ fontSize: 9, color: "rgba(207,239,251,0.5)", cursor: "pointer", textDecoration: "underline", whiteSpace: "nowrap" }}
+            >
+              nova tarefa
+            </span>
+          )}
+        </div>
+      </div>
+
+      {!codeModalMinimized && (
+        <>
+          {/* conversa do Modo Código — fica ABERTA entre pedidos (não fecha nem esvazia
+              sozinha), pra dar pra pedir "corrige esse erro" continuando o mesmo papo
+              enquanto o código aparece do lado, sem precisar sair da janela */}
+          <div style={{ padding: "8px 14px", background: "rgba(0,0,0,0.25)", borderBottom: "1px solid rgba(var(--accent-rgb),0.1)", flex: "none", maxHeight: 200, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+            {codeModeLog.map((m) => (
+              <div key={m.id} style={{ alignSelf: m.role === "user" ? "flex-end" : "flex-start", maxWidth: "88%" }}>
+                <div
+                  style={{
+                    fontSize: 11.5, lineHeight: 1.5, whiteSpace: "pre-wrap", padding: "6px 10px", borderRadius: 6,
+                    color: m.role === "user" ? "#eafcff" : "rgba(207,239,251,0.8)",
+                    background: m.role === "user" ? "rgba(var(--accent-rgb),0.16)" : "rgba(255,255,255,0.05)",
+                    border: `1px solid ${m.role === "user" ? "rgba(var(--accent-rgb),0.3)" : "rgba(255,255,255,0.08)"}`,
+                    fontStyle: m.role === "user" ? "normal" : "italic",
+                  }}
+                >
+                  {m.text}
+                </div>
+              </div>
+            ))}
+            {busy && (
+              <div style={{ alignSelf: "flex-start", maxWidth: "88%" }}>
+                <div style={{ fontSize: 11.5, lineHeight: 1.5, color: "rgba(207,239,251,0.8)", fontStyle: "italic", whiteSpace: "pre-wrap", padding: "6px 10px" }}>
+                  {answer || "…"}
+                </div>
+              </div>
+            )}
+            {!codeModeLog.length && !busy && (
+              <div style={{ fontSize: 11, color: "rgba(207,239,251,0.35)" }}>peça uma mudança de código aqui embaixo, ou pela caixa principal do Assistente.</div>
+            )}
+          </div>
+
+          {/* abas — um arquivo por aba, igual editor de código, clica pra ver outro já escrito */}
+          {codeFilesOpen.length > 0 && (
+            <div style={{ display: "flex", background: "rgba(0,0,0,0.3)", borderBottom: "1px solid rgba(var(--accent-rgb),0.1)", flex: "none", overflowX: "auto" }}>
+              {codeFilesOpen.map((f) => {
+                const isActive = f.path === codeActivePath;
+                const isStreaming = liveCode && f.path === liveCode.path;
+                const fileName = f.path.split("/").pop();
+                return (
+                  <div
+                    key={f.path}
+                    onClick={() => setCodeActiveTab(f.path)}
+                    title={f.path}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 6, padding: "7px 12px",
+                      fontSize: 11, whiteSpace: "nowrap", cursor: "pointer", flex: "none",
+                      color: isActive ? "#eafcff" : "rgba(207,239,251,0.45)",
+                      background: isActive ? "rgba(var(--accent-rgb),0.08)" : "transparent",
+                      borderTop: `2px solid ${isActive ? PU : "transparent"}`,
+                      borderRight: "1px solid rgba(var(--accent-rgb),0.08)",
+                    }}
+                  >
+                    <span style={{ width: 6, height: 6, borderRadius: "50%", flex: "none", background: isStreaming ? OR : GR }} />
+                    {fileName}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* corpo do editor — número de linha + código com realce de sintaxe */}
+          <div style={{ flex: 1, minHeight: 0, overflow: "auto", background: "#050b10" }}>
+            {codeActiveFile ? (
+              codeActiveLang ? (
+                <Highlight code={codeActiveTail} language={codeActiveLang} theme={BB_CODE_THEME}>
+                  {({ tokens, getLineProps, getTokenProps }) => (
+                    <div style={{ display: "flex", fontSize: 11.5, lineHeight: 1.55 }}>
+                      <div style={{ flex: "none", padding: "8px 10px 8px 14px", textAlign: "right", color: "rgba(207,239,251,0.3)", userSelect: "none" }}>
+                        {tokens.map((_, i) => <div key={i}>{i + 1}</div>)}
+                      </div>
+                      <pre style={{ margin: 0, padding: "8px 14px 8px 6px", whiteSpace: "pre-wrap", wordBreak: "break-all", flex: 1 }}>
+                        {tokens.map((line, i) => (
+                          <div key={i} {...getLineProps({ line })}>
+                            {line.map((token, ti) => <span key={ti} {...getTokenProps({ token })} />)}
+                          </div>
+                        ))}
+                      </pre>
+                    </div>
+                  )}
+                </Highlight>
+              ) : (
+                <div style={{ display: "flex", fontSize: 11.5, lineHeight: 1.55 }}>
+                  <div style={{ flex: "none", padding: "8px 10px 8px 14px", textAlign: "right", color: "rgba(207,239,251,0.3)", userSelect: "none" }}>
+                    {codeActiveTail.split("\n").map((_, i) => <div key={i}>{i + 1}</div>)}
+                  </div>
+                  <pre style={{ margin: 0, padding: "8px 14px 8px 6px", whiteSpace: "pre-wrap", wordBreak: "break-all", color: "#cfeffb", flex: 1 }}>{codeActiveTail}</pre>
+                </div>
+              )
+            ) : (
+              <div style={{ padding: "16px 14px", fontSize: 11.5, color: "rgba(207,239,251,0.35)" }}>
+                nenhum arquivo sendo editado ainda — a Lisa está {codeStage ? CODE_STAGE_LABELS[codeStage] : "começando"}…
+              </div>
+            )}
+          </div>
+
+          {/* barra de status inferior */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "4px 12px", background: "rgba(0,0,0,0.4)", borderTop: "1px solid rgba(var(--accent-rgb),0.14)", flex: "none" }}>
+            <span style={{ fontSize: 9.5, color: PU }}>{codeModeRepo || "—"} → {codeModeBranch || "—"}{codeSession?.branchName ? ` (${codeSession.branchName})` : ""}</span>
+            <span style={{ fontSize: 9.5, color: "rgba(207,239,251,0.5)" }}>{liveCodeDone.length} arquivo(s) concluído(s)</span>
+          </div>
+
+          {/* caixa de mensagem própria da janela — dá pra continuar pedindo ajustes ("corrige
+              esse erro") sem sair daqui nem voltar pra caixa principal do Assistente. Textarea
+              grande de propósito (não uma linha só) — pedido mais detalhado (arquivo certo,
+              texto exato do erro) dá resultado bem melhor do que uma frase curta, e precisa de
+              espaço pra escrever isso com conforto. Enter envia, Shift+Enter quebra linha. */}
+          <form
+            onSubmit={(e) => { e.preventDefault(); submitCodeModalInput(); }}
+            style={{ display: "flex", gap: 8, padding: "8px 10px", background: "rgba(0,0,0,0.3)", borderTop: "1px solid rgba(var(--accent-rgb),0.1)", flex: "none", alignItems: "flex-end" }}
+          >
+            <textarea
+              value={codeModalInput}
+              onChange={(e) => setCodeModalInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitCodeModalInput(); }
+              }}
+              disabled={busy}
+              placeholder={busy ? "trabalhando…" : "peça outro ajuste — quanto mais detalhe (arquivo, texto exato do erro), melhor o resultado. Enter envia, Shift+Enter quebra linha."}
+              rows={4}
+              style={{
+                flex: 1, fontSize: 11.5, lineHeight: 1.5, padding: "8px 10px", borderRadius: 5, border: "1px solid rgba(var(--accent-rgb),0.2)",
+                background: "#000", color: "#eafcff", fontFamily: "inherit", resize: "vertical", minHeight: 70,
+              }}
+            />
+            <button
+              type="submit"
+              disabled={busy || !codeModalInput.trim()}
+              style={{
+                fontSize: 10.5, padding: "8px 14px", borderRadius: 5, border: `1px solid ${PU}`,
+                background: "rgba(201,166,255,0.15)", color: "#eafcff", cursor: busy ? "wait" : "pointer", flex: "none",
+              }}
+            >
+              enviar
+            </button>
+          </form>
+
+          {/* alça de redimensionar, canto inferior direito */}
+          {!codeModalMaximized && (
+            <div
+              onPointerDown={onCodeModalResizeStart}
+              title="arrastar para redimensionar"
+              style={{ position: "absolute", right: 2, bottom: 2, width: 14, height: 14, cursor: "nwse-resize", opacity: 0.5 }}
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14"><path d="M12 2 L2 12 M12 6 L6 12 M12 10 L10 12" stroke="rgba(207,239,251,0.5)" strokeWidth="1" /></svg>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+
+  // Modo Tomar nota — o mesmo painel no celular e no desktop. O resultado também vai para o chat
+  // (e para a memória da conversa), para dar para perguntar sobre as notas depois.
+  const tomarNotaOverlay = tomarNota && (
+    <TomarNota
+      temaInicial={tomarNota.tema}
+      aoFechar={() => setTomarNota(null)}
+      aoTerminar={(r) => {
+        const notas = (r.cards || []).slice(0, -1);
+        const texto = `📝 Anotei "${r.tema}" no Abacato: ${notas.length} nota${notas.length === 1 ? "" : "s"} na coluna "${r.coluna?.nome}" do quadro ${r.quadro?.nome}${r.quadro?.novo ? " (criei o quadro agora)" : ""}.\n${notas.map((c) => `• ${c.titulo}`).join("\n")}${r.resumo ? `\n\n${r.resumo}` : ""}\n\n${r.quadro?.url || ""}`.trim();
+        setMessages((m) => [...m, { id: `nota${Date.now()}`, role: "assistant", text: texto }]);
+        lembrarDaLisa(texto);
+        addLog("[NOTA]", PU, `${notas.length} notas em "${r.coluna?.nome}" (${r.quadro?.nome})`);
+      }}
+    />
+  );
+
+  // tela cheia customizada (ver openFullscreen acima) + aviso de mensagem recebida na Câmera de
+  // Vigia — compartilhados entre o branch mobile e o desktop abaixo, computados uma vez só.
+  const fullscreenOverlay = fullscreenSource && (
+    <div
+      onClick={() => setFullscreenSource(null)}
+      style={{ position: "fixed", inset: 0, zIndex: 300, background: "#000", display: "flex", alignItems: "center", justifyContent: "center" }}
+    >
+      <video
+        autoPlay playsInline muted
+        ref={(el) => { if (el && el.srcObject !== fullscreenSource.stream) el.srcObject = fullscreenSource.stream; }}
+        style={{ width: "100%", height: "100%", objectFit: "contain" }}
+      />
+      <div style={{ position: "absolute", top: 16, left: 16, ...mono, fontSize: 10, letterSpacing: 2, color: "#fff", background: "rgba(0,0,0,0.6)", padding: "6px 10px", borderRadius: 4 }}>
+        {fullscreenSource.label}
+      </div>
+      <button
+        onClick={(e) => { e.stopPropagation(); setFullscreenSource(null); }}
+        style={{ position: "absolute", top: 16, right: 16, ...mono, fontSize: 11, letterSpacing: 1.5, padding: "8px 14px", border: "1px solid #fff", borderRadius: 6, background: "rgba(0,0,0,0.6)", color: "#fff", cursor: "pointer" }}
+      >
+        ✕ FECHAR
+      </button>
+    </div>
+  );
+
+  const cameraVigiaMessageToast = cameraVigiaIncomingMsg && (
+    <div style={{ position: "fixed", top: 16, left: "50%", transform: "translateX(-50%)", zIndex: 250, ...mono, fontSize: 12, padding: "10px 18px", borderRadius: 8, background: "rgba(123,216,143,0.95)", color: "#04150a", maxWidth: "80vw", textAlign: "center", boxShadow: "0 4px 20px rgba(0,0,0,0.4)" }}>
+      💬 {cameraVigiaIncomingMsg}
+    </div>
+  );
+
+  // Preview flutuante das transmissões que este dispositivo está ASSISTINDO — fica SEMPRE
+  // montado (não depende de qual categoria de configurações está aberta). Antes, o <video>
+  // vivia dentro do acordeão de categorias — fechar/trocar de categoria enquanto assistia
+  // desmontava o elemento no meio da conexão (erro real visto: "play() ... removed from the
+  // document"), derrubando o vídeo sem motivo nenhum de rede.
+  const watchPreviews = (vigiaWatching || cameraWatching) && (
+    <div style={{ position: "fixed", bottom: 16, right: 16, zIndex: 220, display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
+      {vigiaWatching && (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+          <video
+            ref={vigiaWatchVideoRef} autoPlay playsInline muted
+            onLoadedMetadata={(e) => addLog("[VIGIA]", GR, `vídeo carregado: ${e.target.videoWidth}x${e.target.videoHeight}`)}
+            onClick={(e) => openFullscreen(e.currentTarget, "tela ao vivo")}
+            title="Toque pra ver em tela cheia"
+            style={{ width: 150, aspectRatio: "16/9", borderRadius: 8, objectFit: "cover", border: `1px solid ${GR}`, background: "#000", cursor: "pointer", boxShadow: "0 4px 16px rgba(0,0,0,0.5)" }}
+          />
+          <div style={{ ...mono, fontSize: 9, letterSpacing: 1, color: vigiaWatchStatus === "connected" ? GR : "rgba(207,239,251,0.7)", marginTop: 4, background: "rgba(0,0,0,0.6)", padding: "2px 8px", borderRadius: 4 }}>
+            🖵 {vigiaWatchStatus === "connected" ? "AO VIVO" : (vigiaWatchStatus || "conectando…").toUpperCase()}
+          </div>
+        </div>
+      )}
+      {cameraWatching && (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+          <video
+            ref={cameraWatchVideoRef} autoPlay playsInline muted
+            onClick={(e) => openFullscreen(e.currentTarget, "câmera ao vivo")}
+            title="Toque pra ver em tela cheia"
+            style={{ width: 150, aspectRatio: "16/9", borderRadius: 8, objectFit: "cover", border: `1px solid ${GR}`, background: "#000", cursor: "pointer", boxShadow: "0 4px 16px rgba(0,0,0,0.5)" }}
+          />
+          <div style={{ ...mono, fontSize: 9, letterSpacing: 1, color: cameraWatchStatus === "connected" ? GR : "rgba(207,239,251,0.7)", marginTop: 4, background: "rgba(0,0,0,0.6)", padding: "2px 8px", borderRadius: 4 }}>
+            📷 {cameraWatchStatus === "connected" ? "AO VIVO" : (cameraWatchStatus || "conectando…").toUpperCase()}
+          </div>
+        </div>
+      )}
+      {watchDebugLines.length > 0 && (
+        <div style={{ ...mono, fontSize: 8, lineHeight: 1.6, color: "rgba(207,239,251,0.85)", background: "rgba(0,0,0,0.75)", padding: "6px 8px", borderRadius: 6, maxWidth: 220, textAlign: "left" }}>
+          {watchDebugLines.map((line, i) => <div key={i}>{line}</div>)}
+        </div>
+      )}
+    </div>
+  );
+
+  // Tela do Modo Interativo — a mesma nos dois formatos (no desktop entra como sobreposição de
+  // tela cheia, no mobile como a terceira "view" ao lado de chat/voz). Tela limpa de propósito:
+  // só a carinha, o que ela trouxe, e a dica do gesto.
+  //
+  // O <video> escondido aqui é ESSENCIAL: o reconhecedor de gestos lê de observanceVideoRef, e
+  // se esse elemento não existir o ✌️ simplesmente não funciona (mesma lição do preview que
+  // desmontava junto com a seção da interface). Só montamos quando a Observância está desligada,
+  // porque quando ela está ligada o elemento dela já existe — dois elementos com o MESMO ref
+  // brigariam, e o último a montar ganharia.
+  const interactiveScreen = (
+    // Duas camadas de propósito: a EXTERNA não rola e segura o menu (antes o menu ficava dentro
+    // da área rolável e ia parar em lugar esquisito), a INTERNA é a que rola quando há jogo ou
+    // atividade aberta.
+    <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: "transparent" }}>
+      {!observanceMode && (
+        <video ref={observanceVideoRef} autoPlay playsInline muted style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }} />
+      )}
+
+      {/* menuzinho suspenso: jogos, modo rádio e placar */}
+      <div style={{ position: "absolute", top: 12, right: 12, zIndex: 6, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
+        <button
+          onClick={() => {
+            const opening = !interactiveMenuOpen;
+            setInteractiveMenuOpen(opening);
+            // placar é lido só ao ABRIR o menu (vem do servidor, não precisa ficar consultando)
+            if (opening) {
+              setGameStats(null);
+              setActivityStats(null);
+              loadGames({ limit: 6 }).then(setGameStats);
+              // pontuação das atividades: erro aqui NÃO some da tela — vira um aviso, porque o
+              // motivo mais provável é a tabela ainda não existir no banco
+              fetch("/api/activities")
+                .then((r) => r.json())
+                .then((d) => setActivityStats(d.ok ? d : { error: d.error }))
+                .catch((err) => setActivityStats({ error: err.message }));
+            }
+          }}
+          title="Menu do Modo Interativo"
+          style={{ ...mono, fontSize: 13, width: 34, height: 34, borderRadius: 10, border: "1px solid rgba(var(--accent-rgb),0.3)", background: "rgba(0,0,0,0.55)", color: CY, cursor: "pointer" }}
+        >
+          {interactiveMenuOpen ? "✕" : "☰"}
+        </button>
+
+        {interactiveMenuOpen && (
+          <div
+            style={{
+              width: isMobile ? "min(78vw, 240px)" : 210,
+              // a lista inteira não cabia na tela do celular e sumia cortada: agora ela mesma rola
+              maxHeight: "min(72vh, 560px)", overflowY: "auto", WebkitOverflowScrolling: "touch",
+              padding: 12, borderRadius: 12, border: "1px solid rgba(var(--accent-rgb),0.25)",
+              background: "rgba(4,10,14,0.97)", display: "flex", flexDirection: "column", gap: 8,
+              boxShadow: "0 10px 30px rgba(0,0,0,0.6)",
+            }}
+          >
+            <div style={{ ...mono, fontSize: 8.5, letterSpacing: 2, color: "rgba(207,239,251,0.45)" }}>🏡 MUNDO</div>
+            <button
+              onClick={() => { setInteractiveGame("mundo"); setInteractiveMenuOpen(false); setInteractiveBubble(null); openWorldWindow(); }}
+              title="o terreno dela em isométrico, tela cheia — cresce com o que você joga e estuda nos outros modos"
+              style={{ ...mono, fontSize: 10, letterSpacing: 1, padding: "7px 10px", borderRadius: 6, textAlign: "left", border: `1px solid ${interactiveGame === "mundo" ? CY : "rgba(var(--accent-rgb),0.18)"}`, background: interactiveGame === "mundo" ? "rgba(var(--accent-rgb),0.12)" : "transparent", color: "#eafcff", cursor: "pointer" }}
+            >
+              Mundo da Lisa
+            </button>
+
+            <div style={{ height: 1, background: "rgba(var(--accent-rgb),0.15)", margin: "2px 0" }} />
+            <div style={{ ...mono, fontSize: 8.5, letterSpacing: 2, color: "rgba(207,239,251,0.45)" }}>🎮 JOGOS</div>
+            {[
+              { key: "velha", label: "Jogo da Velha" },
+              { key: "pong", label: "Pong" },
+              { key: "penalti", label: "Cobrança de Pênalti" },
+              { key: "lig4", label: "Lig 4" },
+              { key: "naval", label: "Batalha Naval" },
+              { key: "memoria", label: "Jogo da Memória" },
+              { key: "airhockey", label: "Air Hockey" },
+              { key: "reflexo", label: "Duelo de Reflexo" },
+              { key: "ppt", label: "Pedra-Papel-Tesoura (câmera)" },
+              { key: "disco", label: "Lançar Disco pra Pipoca (2 telas)" },
+            ].map((gm) => (
+              <button
+                key={gm.key}
+                onClick={() => {
+                  setInteractiveGame(gm.key);
+                  setInteractiveMenuOpen(false);
+                  setInteractiveBubble(null);
+                }}
+                style={{ ...mono, fontSize: 10, letterSpacing: 1, padding: "7px 10px", borderRadius: 6, textAlign: "left", border: `1px solid ${interactiveGame === gm.key ? CY : "rgba(var(--accent-rgb),0.18)"}`, background: interactiveGame === gm.key ? "rgba(var(--accent-rgb),0.12)" : "transparent", color: "#eafcff", cursor: "pointer" }}
+              >
+                {gm.label}
+              </button>
+            ))}
+            {interactiveGame && (
+              <button
+                onClick={() => { setInteractiveGame(null); setInteractiveFace(null); setInteractiveMenuOpen(false); }}
+                style={{ ...mono, fontSize: 10, letterSpacing: 1, padding: "7px 10px", borderRadius: 6, border: `1px solid ${OR}`, background: "transparent", color: OR, cursor: "pointer" }}
+              >
+                ✕ Sair do jogo
+              </button>
+            )}
+
+            <div style={{ height: 1, background: "rgba(var(--accent-rgb),0.15)", margin: "2px 0" }} />
+            <div style={{ ...mono, fontSize: 8.5, letterSpacing: 2, color: "rgba(207,239,251,0.45)" }}>🎓 ATIVIDADES</div>
+            {[
+              { key: "quiz", label: "Quiz de Programação" },
+              { key: "pair", label: "Pair Programming" },
+            ].map((act) => (
+              <button
+                key={act.key}
+                onClick={() => {
+                  setInteractiveGame(act.key);
+                  setInteractiveMenuOpen(false);
+                  setInteractiveBubble(null);
+                  if (act.key === "pair") openPairWindow();
+                }}
+                style={{ ...mono, fontSize: 10, letterSpacing: 1, padding: "7px 10px", borderRadius: 6, textAlign: "left", border: `1px solid ${interactiveGame === act.key ? CY : "rgba(var(--accent-rgb),0.18)"}`, background: interactiveGame === act.key ? "rgba(var(--accent-rgb),0.12)" : "transparent", color: "#eafcff", cursor: "pointer" }}
+              >
+                {act.label}
+              </button>
+            ))}
+
+            <div style={{ height: 1, background: "rgba(var(--accent-rgb),0.15)", margin: "2px 0" }} />
+
+            <button
+              onClick={() => { unlockAudioPlayback(); acordarAudio(); setConversaAberta((v) => !v); }}
+              title="Microfone aberto: fale quando quiser, ela responde continuando a conversa"
+              style={{ ...mono, fontSize: 10, letterSpacing: 1, padding: "7px 10px", borderRadius: 6, textAlign: "left", border: `1px solid ${conversaAberta ? GR : "rgba(var(--accent-rgb),0.18)"}`, background: conversaAberta ? "rgba(123,216,143,0.12)" : "transparent", color: "#eafcff", cursor: "pointer" }}
+            >
+              🗣️ Conversa livre: {conversaAberta ? (conversaEstado === "respondendo" ? "respondendo…" : "ouvindo") : "OFF"}
+            </button>
+
+            <button
+              onClick={() => { unlockAudioPlayback(); setRadioMode((v) => !v); }}
+              title="De fone, ela para de olhar o ambiente e reage à música"
+              style={{ ...mono, fontSize: 10, letterSpacing: 1, padding: "7px 10px", borderRadius: 6, textAlign: "left", border: `1px solid ${radioMode ? GR : "rgba(var(--accent-rgb),0.18)"}`, background: radioMode ? "rgba(123,216,143,0.12)" : "transparent", color: "#eafcff", cursor: "pointer" }}
+            >
+              🎧 Modo Rádio: {radioMode ? "ON" : "OFF"}
+            </button>
+
+            <div style={{ height: 1, background: "rgba(var(--accent-rgb),0.15)", margin: "2px 0" }} />
+
+            {/* pontuação das ATIVIDADES (quiz + pair) — vem do banco, separado do placar de
+                jogos porque é pontuação acumulada, não vitória/derrota */}
+            {activityStats && (
+              <>
+                <div style={{ ...mono, fontSize: 8.5, letterSpacing: 2, color: "rgba(207,239,251,0.45)" }}>PONTUAÇÃO</div>
+                {activityStats.error ? (
+                  <div style={{ ...mono, fontSize: 8.5, color: OR }} title={activityStats.error}>tabelas ainda não criadas no banco</div>
+                ) : (
+                  <>
+                    <div style={{ ...mono, fontSize: 11, color: GR, letterSpacing: 1 }}>
+                      {(activityStats.quiz?.points || 0) + (activityStats.pair?.points || 0)} pts
+                    </div>
+                    <div style={{ ...mono, fontSize: 8.5, color: "rgba(207,239,251,0.5)", display: "flex", justifyContent: "space-between" }}>
+                      <span>quiz {activityStats.quiz?.correct || 0}/{activityStats.quiz?.total || 0}</span>
+                      <span>{activityStats.quiz?.points || 0} pts</span>
+                    </div>
+                    <div style={{ ...mono, fontSize: 8.5, color: "rgba(207,239,251,0.5)", display: "flex", justifyContent: "space-between" }}>
+                      <span>pair {activityStats.pair?.done || 0}/{activityStats.pair?.total || 0}</span>
+                      <span>{activityStats.pair?.points || 0} pts</span>
+                    </div>
+                  </>
+                )}
+                <div style={{ height: 1, background: "rgba(var(--accent-rgb),0.15)", margin: "2px 0" }} />
+              </>
+            )}
+
+            {!gameStats ? (
+              <div style={{ ...mono, fontSize: 8.5, color: "rgba(207,239,251,0.35)" }}>carregando placar…</div>
+            ) : (
+              <>
+                <div style={{ ...mono, fontSize: 8.5, letterSpacing: 2, color: "rgba(207,239,251,0.45)", display: "flex", justifyContent: "space-between" }}>
+                  <span>PLACAR DOS JOGOS</span>
+                  {/* deixa claro quando o placar veio da reserva local em vez do banco */}
+                  {gameStats.source === "local" && <span style={{ color: OR }} title="não consegui falar com o servidor — mostrando só o que ficou guardado neste aparelho">local</span>}
+                </div>
+                <div style={{ ...mono, fontSize: 10, display: "flex", gap: 8 }}>
+                  <span style={{ color: GR }}>{gameStats.score.wins}V</span>
+                  <span style={{ color: OR }}>{gameStats.score.losses}D</span>
+                  <span style={{ color: "rgba(207,239,251,0.5)" }}>{gameStats.score.draws}E</span>
+                </div>
+                {gameStats.history.length === 0 ? (
+                  <div style={{ ...mono, fontSize: 8.5, color: "rgba(207,239,251,0.35)" }}>nenhuma partida ainda</div>
+                ) : (
+                  gameStats.history.map((h, i) => (
+                    <div key={i} style={{ ...mono, fontSize: 8.5, color: "rgba(207,239,251,0.5)", display: "flex", justifyContent: "space-between", gap: 6 }}>
+                      <span>{h.game === "penalti" ? "pênalti" : h.game}{h.detail ? ` ${h.detail}` : ""}</span>
+                      <span style={{ color: h.result === "win" ? GR : h.result === "loss" ? OR : "rgba(207,239,251,0.4)" }}>
+                        {h.result === "win" ? "vitória" : h.result === "loss" ? "derrota" : "empate"}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* camada que ROLA: só ela tem overflow, pra o menu acima nunca sair de lugar */}
+      <div
+        style={{
+          flex: 1, minHeight: 0, width: "100%", display: "flex", flexDirection: "column",
+          alignItems: "center",
+          justifyContent: interactiveGame ? "flex-start" : "center",
+          overflowY: interactiveGame ? "auto" : "hidden",
+          overflowX: "hidden",
+          gap: interactiveGame ? 14 : 18,
+          padding: interactiveGame ? (isMobile ? "16px 12px 60px" : "22px 24px 48px") : 24,
+          WebkitOverflowScrolling: "touch",
+        }}
+      >
+      {/* No DESKTOP com atividade aberta, a carinha e o nome viram um cabeçalho HORIZONTAL —
+          empilhado sobrava espaço vazio em cima e empurrava o conteúdo pra fora da tela.
+          No celular continua empilhado, que é o que cabe lá. */}
+      <div style={{ display: "flex", flexDirection: !isMobile && interactiveGame ? "row" : "column", alignItems: "center", gap: !isMobile && interactiveGame ? 14 : 8, flex: "none" }}>
+      {/* expression = assunto/jogo/música (ganha de tudo); reaction = o que ela vê pela câmera
+          (perde pro toque na tela, que é mais imediato) — ver LisaPixelFace.js.
+          De fone, a reação passa a vir da música em vez do ambiente. */}
+      <LisaPixelFace
+        expression={interactiveFace}
+        reaction={radioMode ? (radioNowPlaying ? "vibing" : null) : perceivedFace}
+        speaking={interactiveSpeaking}
+        headphones={radioMode}
+        size={
+          interactiveGame === "quiz" || interactiveGame === "pair" || interactiveGame === "mundo"
+            ? (isMobile ? 90 : 120) // atividades ocupam mais tela: a carinha encolhe mais
+            : interactiveGame
+            ? (isMobile ? 130 : 170)
+            : isMobile
+            ? 260
+            : 340
+        }
+      />
+
+        {/* nome da atividade ao lado da carinha — só no desktop, onde há espaço horizontal */}
+        {!isMobile && interactiveGame && (
+          <div style={{ ...mono, fontSize: 12, letterSpacing: 3, color: CY }}>
+            {INTERACTIVE_LABELS[interactiveGame] || ""}
+          </div>
+        )}
+      </div>
+
+      {/* conteúdo com largura máxima: sem isto, no desktop os jogos ficavam perdidos no meio de
+          uma faixa larguíssima e a leitura do quiz ficava ruim */}
+      {/* o disco é jogo de campo largo (e a tela da Pipoca costuma ficar de lado, sendo vista de
+          longe): 620px espremeriam demais as 64 colunas do campo */}
+      <div style={{ width: "100%", maxWidth: isMobile ? "100%" : interactiveGame === "disco" ? 900 : interactiveGame === "mundo" ? 960 : 620, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+
+      {interactiveGame === "velha" && (
+        <LisaTicTacToe onMood={gameMood} />
+      )}
+      {interactiveGame === "pong" && (
+        <LisaPong onMood={gameMood} />
+      )}
+      {interactiveGame === "penalti" && (
+        <LisaPenalty onMood={gameMood} />
+      )}
+      {interactiveGame === "lig4" && <LisaConnect4 onMood={gameMood} />}
+      {interactiveGame === "naval" && <LisaBattleship onMood={gameMood} />}
+      {interactiveGame === "memoria" && <LisaMemory onMood={gameMood} />}
+      {interactiveGame === "airhockey" && <LisaAirHockey onMood={gameMood} />}
+      {interactiveGame === "reflexo" && <LisaReflex onMood={gameMood} />}
+      {/* o de câmera lê do MESMO <video> escondido que o gesto de acordar usa */}
+      {interactiveGame === "ppt" && <LisaRockPaper videoRef={observanceVideoRef} onMood={gameMood} />}
+      {interactiveGame === "disco" && <LisaDisc onMood={gameMood} />}
+      {/* o Mundo da Lisa mora na janela separada; aqui fica só o atalho pra reabrir */}
+      {interactiveGame === "mundo" && (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, textAlign: "center", maxWidth: 420 }}>
+          <div style={{ ...mono, fontSize: 10, letterSpacing: 1, color: "rgba(207,239,251,0.6)", lineHeight: 1.7 }}>
+            {worldWindowBlocked
+              ? "O NAVEGADOR BLOQUEOU A JANELA — LIBERE O POP-UP DESTE SITE OU ABRA PELO LINK ABAIXO"
+              : "ABRI NUMA JANELA SÓ PRA ISSO — O TERRENO DELA PEDE A TELA INTEIRA"}
+          </div>
+          <button
+            onClick={openWorldWindow}
+            style={{ ...mono, fontSize: 10, letterSpacing: 1.5, padding: "10px 18px", borderRadius: 6, border: `1px solid ${CY}`, background: "rgba(var(--accent-rgb),0.08)", color: "#eafcff", cursor: "pointer" }}
+          >
+            ⛶ ABRIR O MUNDO DE NOVO
+          </button>
+          <a href="/mundo" target="_blank" rel="noopener" style={{ ...mono, fontSize: 9, letterSpacing: 1, color: "rgba(207,239,251,0.4)" }}>
+            ou abrir numa aba: /mundo
+          </a>
+        </div>
+      )}
+      {interactiveGame === "quiz" && <LisaQuiz onMood={gameMood} />}
+      {/* o Pair Programming mora na janela separada; aqui fica só o atalho pra reabrir */}
+      {interactiveGame === "pair" && (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, textAlign: "center", maxWidth: 420 }}>
+          <div style={{ ...mono, fontSize: 10, letterSpacing: 1, color: "rgba(207,239,251,0.6)", lineHeight: 1.7 }}>
+            {pairWindowBlocked
+              ? "O NAVEGADOR BLOQUEOU A JANELA — LIBERE O POP-UP DESTE SITE OU ABRA PELO LINK ABAIXO"
+              : "ABRI NUMA JANELA SÓ PRA ISSO — A IDE PRECISA DA TELA INTEIRA"}
+          </div>
+          <button
+            onClick={openPairWindow}
+            style={{ ...mono, fontSize: 10, letterSpacing: 1.5, padding: "10px 18px", borderRadius: 6, border: `1px solid ${CY}`, background: "rgba(var(--accent-rgb),0.08)", color: "#eafcff", cursor: "pointer" }}
+          >
+            ⛶ ABRIR A JANELA DE NOVO
+          </button>
+          <a href="/pair" target="_blank" rel="noopener" style={{ ...mono, fontSize: 9, letterSpacing: 1, color: "rgba(207,239,251,0.4)" }}>
+            ou abrir numa aba: /pair
+          </a>
+        </div>
+      )}
+
+      {!interactiveGame && interactiveBubble && (
+        <div
+          style={{
+            maxWidth: 520, textAlign: "center", fontSize: isMobile ? 14 : 15.5, lineHeight: 1.5, color: "#eafcff",
+            padding: "12px 18px", borderRadius: 12, border: "1px solid rgba(var(--accent-rgb),0.25)",
+            background: "rgba(var(--accent-rgb),0.06)", animation: "bb-slidein .3s ease",
+          }}
+        >
+          {interactiveBubble.text}
+        </div>
+      )}
+
+      {!interactiveGame && (
+        <div style={{ ...mono, fontSize: 9.5, letterSpacing: 1.5, color: "rgba(207,239,251,0.45)", textAlign: "center", lineHeight: 1.8 }}>
+          <div>✌️ MOSTRE O GESTO PRA CHAMAR · TOQUE NELA PRA INTERAGIR</div>
+          <div style={{ color: observanceError ? OR : "rgba(207,239,251,0.35)" }}>
+            {radioMode
+              ? `🎧 DE FONE — NO MUNDO DELA, REAGINDO À MÚSICA${radioNowPlaying ? ` · ${radioNowPlaying.title}` : ""}`
+              : observanceError
+              ? `⚠ ${observanceError} — sem gesto e sem leitura de expressão`
+              : `ELA REAGE À SUA CARA E AO AMBIENTE${perceivedFace ? ` · vendo: ${perceivedFace}` : ""}`}
+          </div>
+          <div style={{ color: "rgba(207,239,251,0.25)" }}>tudo local — nenhuma imagem sai daqui</div>
+        </div>
+      )}
+      </div>
+      </div>
+    </div>
+  );
+
+  // Widget flutuante do Modo Rádio — SEMPRE montado enquanto radioMode estiver ligado (mesma
+  // lição do bug do preview de "assistir": nunca deixar um player vivo dentro de algo que pode
+  // desmontar por causa de navegação na interface, tipo abrir/fechar categoria).
+  const radioWidget = radioMode && (
+    <div style={{ position: "fixed", bottom: 16, left: 16, zIndex: 210, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6 }}>
+      <div ref={radioContainerRef} style={{ borderRadius: 8, overflow: "hidden", border: `1px solid ${PU}`, boxShadow: "0 4px 16px rgba(0,0,0,0.5)" }} />
+      <div style={{ ...mono, fontSize: 9, letterSpacing: 1, color: "#eafcff", background: "rgba(0,0,0,0.7)", padding: "4px 10px", borderRadius: 4, maxWidth: 220, display: "flex", alignItems: "center", gap: 8 }}>
+        <span>📻 {radioNowPlaying ? `TOCANDO: ${radioNowPlaying.title}` : (radioStatus || "sintonizando…").toUpperCase()}</span>
+        {radioNowPlaying && (
+          <button
+            onClick={() => radioSkipRef.current?.()}
+            title="Pular música"
+            style={{ ...mono, fontSize: 9, letterSpacing: 1, padding: "2px 6px", borderRadius: 3, border: `1px solid ${PU}`, background: "rgba(255,255,255,0.06)", color: "#eafcff", cursor: "pointer", flex: "none" }}
+          >
+            ⏭ PULAR
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
+  // ==========================================================================================
+  // MOBILE — tela própria, só o Assistente (sem Topbar/Sidebar, ver Shell.js): escolhe entre
+  // conversa por CHAT (bolhas, como um app de chat de IA) ou por VOZ (tela escura, só a onda
+  // sonora no meio, como o modo de voz do ChatGPT). Reaproveita TODO o estado/lógica de cima
+  // (ask, toggleMic, canvasRef, voz, escopo) — só a apresentação muda.
+  // ==========================================================================================
+  // ---- revisão visual: gaveta aberta no desktop e o sinal que move a esfera ----
+  const [gaveta, setGaveta] = useState(null); // "registro" | "contexto" | null
+  const sinalDaEsferaRef = useRef({});
+  sinalDaEsferaRef.current = { listening, autoListening, mode, conversaOuvindo: conversaEstado === "ouvindo", gravandoFala };
+  // Lido a cada quadro pela esfera: "falando" vem do áudio tocando de verdade (o mode já voltou
+  // a "idle" quando a fala começa — ver ask()), "ouvindo" do microfone, "pensando" da busca.
+  const obterSinalDaEsfera = useCallback(() => {
+    const s = sinalDaEsferaRef.current;
+    const falando = !!audioRef.current || isBrowserVoiceAudioPlaying() || (typeof window !== "undefined" && window.speechSynthesis?.speaking);
+    if (falando) return { estado: "falando", nivel: nivelDaVoz() };
+    if (s.listening || s.autoListening || s.conversaOuvindo || s.gravandoFala) return { estado: "ouvindo", nivel: nivelDoMicrofone() };
+    if (s.mode === "listening" || s.mode === "speaking") return { estado: "pensando", nivel: null };
+    return { estado: "pronta", nivel: null };
+  }, []);
+
+  if (isMobile) {
+    const autoSyncOk = autoSync?.ok && autoSync.status !== undefined;
+    const autoSyncColor = !autoSync
+      ? "rgba(207,239,251,0.35)"
+      : !autoSync.ok
+      ? OR
+      : autoSync.last_error
+      ? OR
+      : autoSync.status === "running"
+      ? CY
+      : autoSync.started_at
+      ? GR
+      : "rgba(207,239,251,0.35)";
+
+    return (
+      <div className="bb-painel bb-celular" style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column", background: "transparent" }}>
+        {fullscreenOverlay}
+        {tomarNotaOverlay}
+        {cameraVigiaMessageToast}
+        {watchPreviews}
+        {radioWidget}
+        {/* barra do topo — revisão visual: ajustes, marca, modo de conversa e painéis */}
+        <div className="bb-celular-topo">
+          <button type="button" className="bb-redondo" onClick={() => setMobileSettingsOpen(true)} aria-label="Ajustes">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7" /><line x1="4" y1="12" x2="20" y2="12" /><line x1="4" y1="17" x2="14" y2="17" /></svg>
+          </button>
+          <div className="bb-celular-marca">Lisa</div>
+          <div className="bb-celular-modos" role="group" aria-label="Modo de conversa">
+            <button type="button" aria-pressed={mobileView === "chat"} onClick={() => setMobileView("chat")} title="Chat" aria-label="Chat">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>
+            </button>
+            <button type="button" aria-pressed={mobileView === "voice"} onClick={() => setMobileView("voice")} title="Voz" aria-label="Voz">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><circle cx="12" cy="12" r="3.5" /></svg>
+            </button>
+            {/* entrar/sair dessa view É ligar/desligar o modo — evita ficar com a câmera e o
+                laço rodando enquanto você está lendo o chat em outra aba */}
+            <button type="button" aria-pressed={mobileView === "companion"} onClick={() => setMobileView("companion")} title="Modo interativo" aria-label="Modo interativo">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="4" y="7" width="16" height="12" rx="3" /><path d="M12 3v4M9 13h.01M15 13h.01" /></svg>
+            </button>
+            <button type="button" aria-pressed={!!tomarNota} onClick={() => setTomarNota((v) => v || { tema: "" })} title="Tomar nota" aria-label="Tomar nota">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" /><path d="M14 3v5h5M9 13h6M9 17h4" /></svg>
+            </button>
+          </div>
+          <button type="button" className="bb-redondo" onClick={() => setMobileNavOpen(true)} aria-label="Outros painéis" title="Outros painéis">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5" /><rect x="13.5" y="3.5" width="7" height="7" rx="1.5" /><rect x="3.5" y="13.5" width="7" height="7" rx="1.5" /><rect x="13.5" y="13.5" width="7" height="7" rx="1.5" /></svg>
+          </button>
+        </div>
+
+        {mobileView === "companion" ? (
+          // ---- MODO INTERATIVO: tela limpa, só a carinha dela (ver interactiveScreen) ----
+          interactiveScreen
+        ) : mobileView === "voice" ? (
+          // ---- MODO VOZ: a esfera da voz ocupando a tela, e o botão de segurar para falar ----
+          <div className="bb-celular-voz">
+            <div className="bb-celular-esfera">
+              <VisualDaLisa modo={visualDaLisa} obterSinal={obterSinalDaEsfera} ocupacao={0.86} brincadeiras />
+            </div>
+            <RotuloDaVoz obterSinal={obterSinalDaEsfera} />
+            <MicrofoneDaLisa
+              variante="voz"
+              desabilitado={busy}
+              rotulo={mode === "listening" ? `"${question}"` : mode === "speaking" ? "Respondendo…" : null}
+              aoComecar={() => { stopSpeaking(); acordarAudio(); }}
+              aoGravando={setGravandoFala}
+              aoTexto={(q) => ask(q)}
+            />
+          </div>
+        ) : (
+          // ---- MODO CHAT: bolhas de conversa, tipo Gemini/ChatGPT ----
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+            <div style={{ flex: 1, overflowY: "auto", padding: "16px 14px", display: "flex", flexDirection: "column", gap: 12 }}>
+              {messages.length === 0 && !busy && (
+                <div style={{ ...mono, fontSize: 11, color: "rgba(207,239,251,0.4)", textAlign: "center", marginTop: 40 }}>
+                  Oi! Eu sou a Lisa. Pergunte alguma coisa ou toque no microfone.
+                </div>
+              )}
+              {messages.map((m) => (
+                <div
+                  key={m.id}
+                  className={m.role === "user" ? undefined : "bb-balao-lisa"}
+                  style={{
+                    alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+                    maxWidth: "82%", padding: "10px 14px", borderRadius: m.role === "user" ? "14px 14px 3px 14px" : "14px 14px 14px 3px",
+                    background: m.role === "user" ? "rgba(var(--accent-rgb),0.16)" : "rgba(255,255,255,0.06)",
+                    border: `1px solid ${m.role === "user" ? "rgba(var(--accent-rgb),0.3)" : "rgba(255,255,255,0.08)"}`,
+                    fontSize: 14.5, lineHeight: 1.45, color: "#eafcff", whiteSpace: "pre-wrap", userSelect: "text",
+                  }}
+                >
+                  {m.role === "assistant" ? <><TextoComCodigo texto={m.text} /><FontesDaWeb fontes={m.fontes} /></> : (
+                    <>
+                      {m.anexos?.length ? <span className="bb-balao-anexos">{m.anexos.map((a) => <img key={a.id} src={a.previa} alt={a.nome} />)}</span> : null}
+                      {m.text}
+                    </>
+                  )}
+                </div>
+              ))}
+              {busy && answer && (
+                <div className="bb-balao-lisa" style={{ alignSelf: "flex-start", maxWidth: "82%", padding: "10px 14px", borderRadius: "14px 14px 14px 3px", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.08)", fontSize: 14.5, lineHeight: 1.45, color: "#eafcff", whiteSpace: "pre-wrap", userSelect: "text" }}>
+                  {respostaSemCodigo(answer)}
+                </div>
+              )}
+              {busy && !answer && (
+                <div style={{ alignSelf: "flex-start", ...mono, fontSize: 10, color: "rgba(207,239,251,0.4)", padding: "10px 14px" }}>pensando…</div>
+              )}
+              {ttsWaitSeconds !== null && (
+                <div style={{ alignSelf: "flex-start", ...mono, fontSize: 10, color: CY, padding: "10px 14px" }}>
+                  ⏳ aguardando voz do Gemini… {ttsWaitSeconds}s / {SPEAK_TIMEOUT_MS / 1000}s
+                </div>
+              )}
+              {(liveCode || liveCodeDone.length > 0) && (
+                <div style={{ alignSelf: "stretch", ...mono, fontSize: 10.5, background: "#08131a", border: `1px solid ${PU}55`, borderRadius: 8, padding: "10px 12px", maxHeight: 260, overflowY: "auto" }}>
+                  {liveCodeDone.map((f) => (
+                    <div key={f.path} style={{ marginBottom: 8 }}>
+                      <div style={{ color: GR, marginBottom: 3 }}>✓ {f.path}</div>
+                    </div>
+                  ))}
+                  {liveCode && (
+                    <div>
+                      <div style={{ color: PU, marginBottom: 3 }}>✎ {liveCode.path}</div>
+                      <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-all", color: "rgba(207,239,251,0.8)", fontSize: 9.5, lineHeight: 1.4 }}>{liveCode.content.slice(-2000)}</pre>
+                    </div>
+                  )}
+                </div>
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* o contexto da conversa: imagens anexadas e repositórios vinculados */}
+            <div className="bb-contexto-celular">{faixaDoContexto}</div>
+            {/* barra de entrada — sem texto, o microfone (como o do WhatsApp: a faixa da gravação
+                cobre o campo); com texto, o enviar */}
+            <div style={{ position: "relative", display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderTop: "1px solid rgba(var(--accent-rgb),0.12)" }}>
+              <div className="bb-barra-celular" style={{ flex: 1, display: "flex", alignItems: "center", gap: 6, padding: "6px 14px 6px 6px", border: "1px solid rgba(var(--accent-rgb),0.2)", borderRadius: 22, background: "rgba(255,255,255,0.04)" }}>
+                <BotaoMais aoEscolherImagens={anexarImagens} aoVincular={vincularRepo} desabilitado={busy} classeDoBotao="bb-redondo bb-redondo--mais-celular" />
+                <input
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !busy && input.trim()) { ask(input); setInput(""); } }}
+                  disabled={busy}
+                  placeholder={busy ? "processando…" : listening ? "ouvindo…" : "Mensagem…"}
+                  style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "#eafcff", fontSize: 15 }}
+                />
+              </div>
+              {input.trim() ? (
+                <button
+                  onClick={() => { if (!busy) { ask(input); setInput(""); } }}
+                  disabled={busy}
+                  aria-label="Enviar"
+                  style={{ width: 42, height: 42, borderRadius: "50%", flex: "none", border: `1.5px solid ${CY}`, background: "rgba(var(--accent-rgb),0.14)", color: CY, cursor: busy ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+                >
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>
+                </button>
+              ) : (
+                <MicrofoneDaLisa
+                  variante="chat"
+                  desabilitado={busy}
+                  aoComecar={() => { stopSpeaking(); acordarAudio(); }}
+                  aoGravando={setGravandoFala}
+                  aoTexto={(q) => ask(q)}
+                />
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* configurações — escopo, tema, voz, sync */}
+        {mobileSettingsOpen && (
+          <div
+            onClick={() => setMobileSettingsOpen(false)}
+            style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "flex-end" }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="bb-folha-celular"
+              style={{ width: "100%", maxHeight: "80vh", overflowY: "auto", padding: "18px 18px 28px" }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+                <div style={{ ...mono, fontSize: 11, letterSpacing: 2, color: CY }}>◈ CONFIGURAÇÕES</div>
+                <button onClick={() => setMobileSettingsOpen(false)} style={{ ...mono, fontSize: 10, padding: "5px 10px", border: "1px solid rgba(var(--accent-rgb),0.2)", borderRadius: 4, background: "transparent", color: "rgba(207,239,251,0.6)", cursor: "pointer" }}>✕ fechar</button>
+              </div>
+
+{!usuario && (<>
+              {/* escopo */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginBottom: 8 }}>ESCOPO</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                {[{ key: "panel", label: "ESTE PAINEL" }, { key: "general", label: "GERAL" }].map((m) => (
+                  <button key={m.key} onClick={() => setScopeMode(m.key)} style={{ ...mono, fontSize: 10, padding: "8px 12px", borderRadius: 6, border: `1px solid ${scopeMode === m.key ? CY : "rgba(var(--accent-rgb),0.18)"}`, background: scopeMode === m.key ? "rgba(var(--accent-rgb),0.12)" : "transparent", color: scopeMode === m.key ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", flex: 1 }}>{m.label}</button>
+                ))}
+              </div>
+              {scopeMode === "panel" && (
+                <select value={scopePanel} onChange={(e) => setScopePanel(e.target.value)} style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "#000", color: "#eafcff", width: "100%", marginBottom: 10 }}>
+                  {panelOptions.map((b) => <option key={b} value={b}>{b}</option>)}
+                  <option value={TASKS_SCOPE}>Tarefas (por prazo)</option>
+                  <option value={THOUGHTS_SCOPE}>Pensamentos</option>
+                  <option value={SENTINEL_SCOPE}>Chamados (Sentinela)</option>
+                  <option value={WORK_SCOPE}>Tarefas do trabalho</option>
+                  <option value={CODE_SCOPE}>Código</option>
+                </select>
+              )}
+              {scopeMode === "panel" && scopePanel === SENTINEL_SCOPE && (
+                <select value={sentinelProjectId} onChange={(e) => setSentinelProjectId(e.target.value)} style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: `1px solid ${OR}55`, background: "#000", color: "#eafcff", width: "100%", marginBottom: 10 }}>
+                  <option value="all">Todos os projetos</option>
+                  {sentinelProjects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+              )}
+              {scopeMode === "panel" && scopePanel === CODE_SCOPE && (
+                <>
+                  <select value={codeRepo} onChange={(e) => setCodeRepo(e.target.value)} style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: `1px solid ${PU}55`, background: "#000", color: "#eafcff", width: "100%", marginBottom: 10 }}>
+                    <option value="all">Todos os repositórios</option>
+                    {codeRepos.map((r) => <option key={r.id} value={r.full_name}>{r.full_name}</option>)}
+                  </select>
+                  {codeRepo !== "all" && (
+                    <select value={codeFile} onChange={(e) => setCodeFile(e.target.value)} style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: `1px solid ${PU}55`, background: "#000", color: "#eafcff", width: "100%", marginBottom: 10 }}>
+                      <option value="">Busca no repositório inteiro</option>
+                      {codeFiles.map((f) => <option key={f} value={f}>{f}</option>)}
+                    </select>
+                  )}
+                </>
+              )}
+
+</>)}
+              {/* voz */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>VOZ</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                <button onClick={() => { if (voiceOn) stopSpeaking(); setVoiceOn((v) => !v); }} style={{ ...mono, fontSize: 10, padding: "8px 12px", borderRadius: 6, border: `1px solid ${voiceOn ? CY : "rgba(207,239,251,0.3)"}`, background: voiceOn ? "rgba(var(--accent-rgb),0.1)" : "transparent", color: voiceOn ? "#eafcff" : "rgba(207,239,251,0.5)", cursor: "pointer", flex: 1 }}>{voiceOn ? "🔊 falar respostas: ON" : "🔇 falar respostas: OFF"}</button>
+              </div>
+              <select value={voiceName} onChange={(e) => { setVoiceName(e.target.value); if (typeof window !== "undefined") localStorage.setItem("voiceName", e.target.value); }} style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "#000", color: "#eafcff", width: "100%", marginBottom: 10 }}>
+                {TTS_VOICES.map((v) => <option key={v.name} value={v.name}>{v.name} · {v.trait}</option>)}
+              </select>
+
+              {/* tema */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>COR DE DESTAQUE</div>
+              <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+                {ACCENT_THEMES.map((t) => (
+                  <button key={t.name} onClick={() => chooseAccent(t)} title={t.name} style={{ width: 30, height: 30, borderRadius: "50%", background: t.hex, border: `2px solid ${accentName === t.name ? "#eafcff" : "transparent"}`, cursor: "pointer" }} />
+                ))}
+              </div>
+
+              {/* aplicativo: some quando o navegador não oferece instalar (e não é iPhone) */}
+              {(instalacao.pode || instalacao.ios || instalacao.instalado) && (
+                <>
+                  <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>APLICATIVO</div>
+                  {instalacao.instalado ? (
+                    <div style={{ fontSize: 13, color: "rgba(207,239,251,0.6)", marginBottom: 14 }}>Você já está no app instalado.</div>
+                  ) : (
+                    <>
+                      <button
+                        onClick={instalacao.instalar}
+                        style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${CY}`, background: "rgba(var(--accent-rgb),0.12)", color: "#eafcff", cursor: "pointer", width: "100%", marginBottom: 6 }}
+                      >
+                        ⤓ Instalar a Lisa como app
+                      </button>
+                      <div style={{ fontSize: 12, color: "rgba(207,239,251,0.5)", marginBottom: 14 }}>
+                        {instalacao.ios ? DICA_DO_IPHONE : "Ganha ícone na tela inicial e abre em tela cheia, sem a barra do navegador."}
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+
+              {/* a conta: e-mail, acesso, uso do dia, perfil e Sair (o celular não tem o topo) */}
+              <ContaNoCelular />
+
+{!usuario && (<>
+              {/* persona */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>PERSONALIDADE</div>
+              <button
+                onClick={togglePersonaMode}
+                style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${personaMode ? PU : "rgba(var(--accent-rgb),0.18)"}`, background: personaMode ? "rgba(201,166,255,0.12)" : "transparent", color: personaMode ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 14 }}
+              >
+                🎭 Modo Persona: {personaMode ? "ON" : "OFF"}
+              </button>
+
+              {/* modo código */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>MODO CÓDIGO</div>
+              <button
+                onClick={() => setCodeMode((v) => !v)}
+                style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${codeMode ? PU : "rgba(var(--accent-rgb),0.18)"}`, background: codeMode ? "rgba(201,166,255,0.12)" : "transparent", color: codeMode ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+              >
+                🛠️ Modo Código: {codeMode ? "ON" : "OFF"}
+              </button>
+              {codeMode && (
+                <>
+                  <select value={codeModeRepo} onChange={(e) => setCodeModeRepo(e.target.value)} style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "#000", color: "#eafcff", width: "100%", marginBottom: 8 }}>
+                    <option value="">repositório…</option>
+                    {codeModeRepos.map((r) => <option key={r.id} value={r.full_name}>{r.full_name}</option>)}
+                  </select>
+                  {codeModeRepo && (
+                    <select value={codeModeBranch} onChange={(e) => setCodeModeBranch(e.target.value)} style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "#000", color: "#eafcff", width: "100%", marginBottom: 8 }}>
+                      <option value="">branch base…</option>
+                      {codeModeBranches.map((b) => <option key={b} value={b}>{b}</option>)}
+                    </select>
+                  )}
+                  {codeModeRepo && codeModeAvailableFiles.length > 0 && (
+                    <>
+                      <div style={{ ...mono, fontSize: 9, letterSpacing: 1, color: "rgba(207,239,251,0.45)", marginBottom: 4 }}>
+                        ARQUIVOS FIXOS (opcional, até {CODE_MODE_MAX_FILES} — ctrl/cmd+clique pra marcar mais de um; garante que entrem no contexto de toda pergunta enquanto o Modo Código estiver ligado)
+                      </div>
+                      <select
+                        multiple
+                        value={codeModeFiles}
+                        onChange={(e) => setCodeModeFiles(Array.from(e.target.selectedOptions).map((o) => o.value).slice(0, CODE_MODE_MAX_FILES))}
+                        style={{ ...mono, fontSize: 11, padding: "6px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "#000", color: "#eafcff", width: "100%", height: 100, marginBottom: 8 }}
+                      >
+                        {codeModeAvailableFiles.map((f) => <option key={f} value={f}>{f}</option>)}
+                      </select>
+                    </>
+                  )}
+                  <div style={{ fontSize: 10.5, color: "rgba(207,239,251,0.45)", marginBottom: 14, lineHeight: 1.4 }}>
+                    Com isso ligado, toda mensagem vira um pedido de mudança de código nesse
+                    repositório/branch — ela cria uma branch nova e abre um Pull Request, nunca
+                    mescla sozinha.
+                  </div>
+                </>
+              )}
+
+              {/* observância */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>OBSERVÂNCIA (CÂMERA)</div>
+              <button
+                onClick={() => setObservanceMode((v) => !v)}
+                style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${observanceMode ? GR : "rgba(var(--accent-rgb),0.18)"}`, background: observanceMode ? "rgba(123,216,143,0.12)" : "transparent", color: observanceMode ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+              >
+                👁 Modo Observância: {observanceMode ? "ON" : "OFF"}
+              </button>
+              {observanceMode && (
+                <>
+                  <video ref={observanceVideoRef} autoPlay playsInline muted style={{ width: "100%", maxWidth: 160, aspectRatio: "4/3", borderRadius: 6, objectFit: "cover", border: `1px solid ${GR}55`, marginBottom: 6, display: "block" }} />
+                  <button
+                    onClick={() => setCameraFacing((f) => (f === "user" ? "environment" : "user"))}
+                    style={{ ...mono, fontSize: 10, padding: "8px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "transparent", color: "rgba(207,239,251,0.7)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+                  >
+                    🔄 câmera: {cameraFacing === "user" ? "frontal" : "traseira"} (trocar)
+                  </button>
+                </>
+              )}
+              {observanceError && <div style={{ ...mono, fontSize: 9.5, color: OR, marginBottom: 8 }}>⚠ {observanceError}</div>}
+              <div style={{ fontSize: 11, color: "rgba(207,239,251,0.45)", marginBottom: 14, lineHeight: 1.4 }}>
+                Tira 1 foto só no instante de cada pergunta pra Lisa poder ver o que você mostra — nada fica salvo.
+                Com o modo ligado, ela também cumprimenta sozinha quem mora com você (configurado em LISA_CASA) quando reconhece na câmera.
+              </div>
+
+</>)}
+              {/* Modo Tela — compartilhar a tela do dispositivo. A maioria dos navegadores de
+                  CELULAR não tem suporte a getDisplayMedia (compartilhamento de tela) — o botão
+                  fica disponível, mas se o seu navegador não suportar, aparece o aviso de erro
+                  abaixo em vez de travar/fingir que funcionou. */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>MODO TELA</div>
+              <button
+                onClick={() => setScreenMode((v) => !v)}
+                style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${screenMode ? GR : "rgba(var(--accent-rgb),0.18)"}`, background: screenMode ? "rgba(123,216,143,0.12)" : "transparent", color: screenMode ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+              >
+                🖵 Modo Tela: {screenMode ? "ON" : "OFF"}
+              </button>
+              {screenMode && (
+                <>
+                  <video ref={screenVideoRef} autoPlay playsInline muted title="o que está sendo compartilhado" style={{ width: "100%", maxWidth: 160, aspectRatio: "4/3", borderRadius: 6, objectFit: "cover", border: `1px solid ${GR}55`, marginBottom: 8, display: "block" }} />
+                  <button
+                    onClick={() => setScreenAutoComment((v) => !v)}
+                    style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${screenAutoComment ? PU : "rgba(var(--accent-rgb),0.18)"}`, background: screenAutoComment ? "rgba(201,166,255,0.12)" : "transparent", color: screenAutoComment ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+                  >
+                    💬 Vigiar sozinha: {screenAutoComment ? "ON" : "OFF"}
+                  </button>
+                  {screenAutoComment && (
+                    <>
+                      <select
+                        value={screenIntervalMs}
+                        onChange={(e) => chooseScreenInterval(Number(e.target.value))}
+                        style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "#000", color: "#eafcff", width: "100%", marginBottom: 8 }}
+                      >
+                        {SCREEN_INTERVAL_OPTIONS.map((o) => <option key={o.value} value={o.value}>a cada {o.label}</option>)}
+                      </select>
+                      <input
+                        value={screenFocus}
+                        onChange={(e) => updateScreenFocus(e.target.value)}
+                        placeholder="direcionamento (ex.: avise se o build quebrar)"
+                        style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "#000", color: "#eafcff", width: "100%", marginBottom: 8 }}
+                      />
+                    </>
+                  )}
+{!usuario && (<>
+                  <button
+                    onClick={() => setTransmissionMode((v) => !v)}
+                    style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${transmissionMode ? OR : "rgba(var(--accent-rgb),0.18)"}`, background: transmissionMode ? "rgba(217,89,38,0.12)" : "transparent", color: transmissionMode ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+                  >
+                    📡 Transmissão: {transmissionMode ? "ON" : "OFF"}
+                  </button>
+                  {transmissionMode && (
+                    <div style={{ fontSize: 10.5, color: "rgba(207,239,251,0.45)", marginBottom: 8, lineHeight: 1.4 }}>
+                      Outro dispositivo com o Modo Vigia (abaixo) pode assistir esta tela AO VIVO agora.
+                    </div>
+                  )}</>)}
+
+                </>
+              )}
+              {screenError && <div style={{ ...mono, fontSize: 9.5, color: OR, marginBottom: 8 }}>⚠ {screenError}</div>}
+              <div style={{ fontSize: 11, color: "rgba(207,239,251,0.45)", marginBottom: 14, lineHeight: 1.4 }}>
+                O navegador sempre pede permissão nativa pra escolher o que compartilhar. A maioria
+                dos navegadores de CELULAR não suporta compartilhamento de tela por um site — se
+                for o seu caso, o aviso acima vai dizer isso claramente.
+              </div>
+
+{!usuario && (<>
+              {/* Câmera de Vigia — como o Modo Tela, só que filma com a câmera do dispositivo
+                  (áudio junto) em vez da tela. Funciona em celular também (ao contrário do Modo
+                  Tela). Quem assiste (Modo Vigia, "Assistir Câmera de Vigia") pode mandar
+                  mensagens que a Lisa lê em voz alta e mostra aqui — tipo um interfone. */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>CÂMERA DE VIGIA</div>
+              <button
+                onClick={() => setCameraVigiaMode((v) => !v)}
+                style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${cameraVigiaMode ? GR : "rgba(var(--accent-rgb),0.18)"}`, background: cameraVigiaMode ? "rgba(123,216,143,0.12)" : "transparent", color: cameraVigiaMode ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+              >
+                📷 Câmera de Vigia: {cameraVigiaMode ? "ON" : "OFF"}
+              </button>
+              {cameraVigiaMode && (
+                <>
+                  <video
+                    ref={cameraVigiaVideoRef} autoPlay playsInline muted
+                    onLoadedMetadata={(e) => addLog("[CÂMERA]", GR, `preview carregado: ${e.target.videoWidth}x${e.target.videoHeight}`)}
+                    onError={() => addLog("[CÂMERA]", OR, "preview: erro ao decodificar o vídeo")}
+                    title="o que a câmera de vigia está vendo"
+                    style={{ width: "100%", maxWidth: 160, aspectRatio: "4/3", borderRadius: 6, objectFit: "cover", border: `1px solid ${GR}55`, marginBottom: 6, display: "block" }}
+                  />
+                  <button
+                    onClick={() => setCameraFacing((f) => (f === "user" ? "environment" : "user"))}
+                    style={{ ...mono, fontSize: 10, padding: "8px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "transparent", color: "rgba(207,239,251,0.7)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+                  >
+                    🔄 câmera: {cameraFacing === "user" ? "frontal" : "traseira"} (trocar)
+                  </button>
+                </>
+              )}
+              {cameraVigiaError && <div style={{ ...mono, fontSize: 9.5, color: OR, marginBottom: 8 }}>⚠ {cameraVigiaError}</div>}
+              <div style={{ fontSize: 11, color: "rgba(207,239,251,0.45)", marginBottom: 14, lineHeight: 1.4 }}>
+                Grava com áudio (pra servir de monitor de ambiente) e fica assistível ao vivo por
+                outro dispositivo, no Modo Vigia.
+              </div>
+
+              {/* modo vigia — NÃO depende de screenMode neste aparelho: lê a memória salva pela
+                  vigília, e assiste ao vivo via Transmissão (que pode estar rodando em OUTRO
+                  dispositivo) — então funciona até no celular enquanto o Modo Tela roda só no
+                  computador. */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>MODO VIGIA</div>
+              <button
+                onClick={() => setVigiaMode((v) => !v)}
+                style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${vigiaMode ? OR : "rgba(var(--accent-rgb),0.18)"}`, background: vigiaMode ? "rgba(217,89,38,0.12)" : "transparent", color: vigiaMode ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+              >
+                👁️ Modo Vigia: {vigiaMode ? "ON" : "OFF"}
+              </button>
+              {vigiaMode && (
+                <>
+                  <button
+                    onClick={() => setVigiaAutoOn((v) => !v)}
+                    style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${vigiaAutoOn ? PU : "rgba(var(--accent-rgb),0.18)"}`, background: vigiaAutoOn ? "rgba(201,166,255,0.12)" : "transparent", color: vigiaAutoOn ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+                  >
+                    💬 Narrar sozinha: {vigiaAutoOn ? "ON" : "OFF"}
+                  </button>
+                  {vigiaAutoOn && (
+                    <select
+                      value={vigiaAutoIntervalMs}
+                      onChange={(e) => chooseVigiaAutoInterval(Number(e.target.value))}
+                      style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "#000", color: "#eafcff", width: "100%", marginBottom: 8 }}
+                    >
+                      {SCREEN_INTERVAL_OPTIONS.map((o) => <option key={o.value} value={o.value}>a cada {o.label}</option>)}
+                    </select>
+                  )}
+                  <button
+                    onClick={() => setVigiaWatching((v) => !v)}
+                    style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${vigiaWatching ? GR : "rgba(var(--accent-rgb),0.18)"}`, background: vigiaWatching ? "rgba(123,216,143,0.12)" : "transparent", color: vigiaWatching ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+                  >
+                    📺 Assistir ao vivo: {vigiaWatching ? "ON" : "OFF"}
+                  </button>
+                  {vigiaWatching && (
+                    <div style={{ ...mono, fontSize: 10, color: vigiaWatchStatus === "connected" ? GR : "rgba(207,239,251,0.45)", marginBottom: 8 }}>
+                      {vigiaWatchStatus === "connected" ? "● ao vivo — veja o preview no canto da tela" : vigiaWatchStatus === "procurando" ? "procurando o outro dispositivo…" : vigiaWatchStatus || "conectando…"}
+                    </div>
+                  )}
+                  <button
+                    onClick={() => setCameraWatching((v) => !v)}
+                    style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${cameraWatching ? GR : "rgba(var(--accent-rgb),0.18)"}`, background: cameraWatching ? "rgba(123,216,143,0.12)" : "transparent", color: cameraWatching ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+                  >
+                    📷 Assistir Câmera de Vigia: {cameraWatching ? "ON" : "OFF"}
+                  </button>
+                  {cameraWatching && (
+                    <>
+                      <div style={{ ...mono, fontSize: 10, color: cameraWatchStatus === "connected" ? GR : "rgba(207,239,251,0.45)", marginBottom: 8 }}>
+                        {cameraWatchStatus === "connected" ? "● ao vivo — veja o preview no canto da tela" : cameraWatchStatus === "procurando" ? "procurando o outro dispositivo…" : cameraWatchStatus || "conectando…"}
+                      </div>
+                      <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                        <input
+                          value={cameraChatText}
+                          onChange={(e) => setCameraChatText(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") sendCameraChat(); }}
+                          placeholder="mensagem pra Lisa ler lá (ex.: hora de dormir)"
+                          style={{ ...mono, fontSize: 12, padding: "10px 12px", borderRadius: 6, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "#000", color: "#eafcff", flex: 1 }}
+                        />
+                        <button
+                          onClick={sendCameraChat}
+                          style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${GR}`, background: "rgba(123,216,143,0.12)", color: "#eafcff", cursor: "pointer" }}
+                        >
+                          ENVIAR
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+              <div style={{ fontSize: 11, color: "rgba(207,239,251,0.45)", marginBottom: 14, lineHeight: 1.4 }}>
+                Perguntas buscam no HISTÓRICO de observações que a Lisa já fez sobre sua tela.
+                "Assistir ao vivo" mostra a tela em tempo real de outro dispositivo com Modo Tela
+                + Transmissão ligados (funciona melhor na mesma rede/Wi-Fi). Tudo isso funciona
+                em qualquer aparelho, mesmo sem o Modo Tela ligado aqui.
+              </div>
+
+              {/* Modo Rádio — a Lisa incorpora uma apresentadora de rádio, alternando locução
+                  (novidades reais de Abacato/Tarefas do trabalho/Sentinela/Pensamentos) com música de
+                  verdade da playlist (radio/playlist.txt, tocada via YouTube). */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>MODO RÁDIO</div>
+              <button
+                onClick={() => { unlockAudioPlayback(); setRadioMode((v) => !v); }}
+                style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${radioMode ? PU : "rgba(var(--accent-rgb),0.18)"}`, background: radioMode ? "rgba(201,166,255,0.12)" : "transparent", color: radioMode ? "#eafcff" : "rgba(207,239,251,0.55)", cursor: "pointer", width: "100%", marginBottom: 8 }}
+              >
+                📻 Modo Rádio: {radioMode ? "ON" : "OFF"}
+              </button>
+              <div style={{ fontSize: 11, color: "rgba(207,239,251,0.45)", marginBottom: 14, lineHeight: 1.4 }}>
+                A Lisa vira apresentadora: alterna blocos de novidades reais (Abacato, Tarefas
+                Tarefas do trabalho, Sentinela, Pensamentos) com música da sua playlist — anuncia antes de
+                tocar e comenta depois. Veja o player no canto inferior esquerdo da tela.
+              </div>
+
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>MODO ESCUTA</div>
+              <button
+                onClick={() => setMicWatchMode((v) => !v)}
+                disabled={!screenMode && !observanceMode}
+                title={!screenMode && !observanceMode ? "ligue o Modo Tela ou a Observância primeiro" : undefined}
+                style={{ ...mono, fontSize: 10.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${micWatchMode ? GR : "rgba(var(--accent-rgb),0.18)"}`, background: micWatchMode ? "rgba(123,216,143,0.12)" : "transparent", color: (!screenMode && !observanceMode) ? "rgba(207,239,251,0.3)" : (micWatchMode ? "#eafcff" : "rgba(207,239,251,0.55)"), cursor: (!screenMode && !observanceMode) ? "not-allowed" : "pointer", width: "100%", marginBottom: 8 }}
+              >
+                🎙️ Modo Escuta: {micWatchMode && (screenMode || observanceMode) ? "ON (ouvindo)" : "OFF"}
+              </button>
+              {autoListening && (
+                <div style={{ ...mono, fontSize: 11, letterSpacing: 1, padding: "8px 12px", borderRadius: 6, border: `1px solid ${GR}`, background: "rgba(123,216,143,0.18)", color: "#eafcff", marginBottom: 8, textAlign: "center", animation: "bb-dot 0.9s ease-in-out infinite" }}>
+                  🎙️ PODE FALAR AGORA
+                </div>
+              )}
+              {micWatchError && <div style={{ ...mono, fontSize: 9.5, color: OR, marginBottom: 8 }}>⚠ {micWatchError}</div>}
+              <div style={{ fontSize: 11, color: "rgba(207,239,251,0.45)", marginBottom: 14, lineHeight: 1.4 }}>
+                Microfone fica de verdade aberto (não é o "segure pra falar" de sempre) enquanto o
+                Modo Tela ou a Observância também estiverem ligados — grava pedacinhos curtos, a
+                Lisa comenta se achar algo (inclusive se você estiver cantando), e descarta na
+                hora. Nada de áudio fica salvo.
+              </div>
+
+              {/* sync */}
+              <div style={{ ...mono, fontSize: 9, letterSpacing: 2, color: "rgba(var(--accent-rgb),0.5)", marginTop: 14, marginBottom: 8 }}>SINCRONIZAÇÃO</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span style={{ width: 8, height: 8, borderRadius: "50%", background: autoSyncColor, boxShadow: `0 0 8px ${autoSyncColor}`, flex: "none" }} />
+                <span style={{ ...mono, fontSize: 10.5, color: "rgba(207,239,251,0.7)" }}>
+                  AUTO-SYNC {!autoSync ? "…" : !autoSync.ok ? "não configurado" : autoSync.status === "running" ? "em andamento" : autoSync.started_at ? "ok" : "nunca rodou"}
+                </span>
+              </div>
+              <button
+                onClick={manualSync}
+                disabled={ingesting}
+                style={{ ...mono, fontSize: 10.5, letterSpacing: 1.5, padding: "10px 14px", borderRadius: 6, border: `1px solid ${ingesting ? OR : CY}`, background: "rgba(var(--accent-rgb),0.08)", color: ingesting ? OR : "#eafcff", cursor: ingesting ? "wait" : "pointer", width: "100%" }}
+              >
+                {ingesting ? "SINCRONIZANDO…" : "◈ SYNC AGORA"}
+              </button>
+</>)}
+            </div>
+          </div>
+        )}
+
+        {/* atalho pros outros painéis — no mobile o Assistente é tela cheia e não tem
+            Sidebar/Topbar, então sem isso não teria como chegar em nenhum outro lugar do app */}
+        {mobileNavOpen && (
+          <div
+            onClick={() => setMobileNavOpen(false)}
+            style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end" }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{ width: "100%", maxHeight: "80vh", overflowY: "auto", background: "#08131a", borderTop: "1px solid rgba(var(--accent-rgb),0.25)", borderRadius: "16px 16px 0 0", padding: "18px 18px 28px" }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+                <div style={{ ...mono, fontSize: 11, letterSpacing: 2, color: CY }}>◈ OUTROS PAINÉIS</div>
+                <button onClick={() => setMobileNavOpen(false)} style={{ ...mono, fontSize: 10, padding: "5px 10px", border: "1px solid rgba(var(--accent-rgb),0.2)", borderRadius: 4, background: "transparent", color: "rgba(207,239,251,0.6)", cursor: "pointer" }}>✕ fechar</button>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {[
+                  { href: "/fluxogramas", glyph: "◇", label: "PROCESSMAP" },
+                  { href: "/lisa-task", glyph: "✓", label: "LISA TASK", novaAba: true },
+                  { href: "/visual", glyph: "◎", label: "VISUAL DA LISA" },
+                  { href: "/dashboard", glyph: "▧", label: "DASHBOARD" },
+                  { href: "/dashboard/ar", glyph: "◫", label: "DASHBOARD · MODO AR" },
+                  { href: "/", glyph: "◈", label: "QUARTO DE GUERRA" },
+                  { href: "/boards", glyph: "▦", label: "BOARDS" },
+                  { href: "/tasks", glyph: "⏱", label: "TAREFAS" },
+                  { href: "/thoughts", glyph: "✎", label: "PENSAMENTOS" },
+                  { href: "/sentinel", glyph: "◆", label: "SENTINELA" },
+                  { href: "/news", glyph: "📰", label: "NOTÍCIAS & CLIMA" },
+                  { href: "/gemini-keys", glyph: "🔑", label: "CHAVES GEMINI" },
+                  { href: "/work-tasks", glyph: "🏢", label: "TAREFAS DO TRABALHO" },
+                  { href: "/scheduled-announcements", glyph: "⏰", label: "FALAS AGENDADAS" },
+                  { href: "/code-repos", glyph: "🐙", label: "REPOSITÓRIOS" },
+                  { href: "/code-tasks", glyph: "🛠️", label: "TAREFAS DE CÓDIGO" },
+                  { href: "/arch-docs", glyph: "🗺️", label: "MAPA DE ARQUITETURA" },
+                  { href: "/test-mode", glyph: "🧪", label: "MODO DE TESTES" },
+                  { href: "/sync-status", glyph: "📊", label: "PROGRESSO DO SYNC" },
+                ].filter((item) => podeAcessar(papel || "usuario", item.href)).map((item) => (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    target={item.novaAba ? "_blank" : undefined}
+                    rel={item.novaAba ? "noopener" : undefined}
+                    onClick={() => setMobileNavOpen(false)}
+                    style={{ ...mono, fontSize: 12, letterSpacing: 1.5, padding: "14px 16px", borderRadius: 8, border: "1px solid rgba(var(--accent-rgb),0.18)", background: "rgba(var(--accent-rgb),0.05)", color: "#eafcff", textDecoration: "none", display: "flex", alignItems: "center", gap: 12 }}
+                  >
+                    <span style={{ color: CY }}>{item.glyph}</span> {item.label}
+                  </Link>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+        {codeTaskModal}
+        {ideDaLisa}
+        {quadroDaLisa}
+      </div>
+    );
+  }
+
+  // ---- DESKTOP — revisão visual (out/2026): a esfera no centro, a conversa embaixo dela e
+  // TODO o resto em menus discretos. Os controles são exatamente os de antes (mesmos estados e
+  // mesmas funções); só mudaram de lugar:
+  //   • "Modos" e "⚙" vão para o topo do app (TopoExtra) — eram a barra ESCOPO + cinco gavetas
+  //   • o escopo vai para dentro do campo de mensagem
+  //   • SYSTEM_LOGS e RETRIEVED_CONTEXT viram gavetas laterais, fechadas por padrão
+  //   • as prévias de câmera/tela ficam sempre montadas enquanto o modo estiver ligado (antes
+  //     sumiam ao fechar a gaveta — e a captura lê desses mesmos <video>)
+  const modosLigados = [
+    observanceMode, screenMode, micWatchMode && (screenMode || observanceMode), cameraVigiaMode,
+    vigiaMode, radioMode, escutaPalavra, codeMode, personaMode,
+  ].filter(Boolean).length;
+  const nomeDoEscopo = scopeMode === "general"
+    ? "Geral"
+    : scopePanel === TASKS_SCOPE ? "Tarefas"
+    : scopePanel === THOUGHTS_SCOPE ? "Pensamentos"
+    : scopePanel === SENTINEL_SCOPE ? "Sentinela"
+    : scopePanel === WORK_SCOPE ? "Tarefas do trabalho"
+    : scopePanel === CODE_SCOPE ? "Código"
+    : scopePanel || "Este painel";
+  const enviarPergunta = () => {
+    acordarAudio();
+    if (!busy && input.trim()) { ask(input); setInput(""); }
+  };
+  const estadoGeminiVoz = !geminiVoiceEnabled
+    ? "desligada — usando a voz do navegador"
+    : geminiVoiceStatus === true ? "funcionando"
+    : geminiVoiceStatus === false ? "a última tentativa falhou"
+    : "ainda sem tentativa nesta sessão";
+
+  // ---- a janela da resposta (01/11/2026): o que antes ficava escrito embaixo do visual ----
+  const falaDaResposta = mode === "speaking" || answer ? respostaSemCodigo(separarRascunho(answer).fala) : "";
+  const rascunhoDaResposta = separarRascunho(answer).rascunho;
+  const janelaNaTela = !janelaFechada && Boolean(question) && (busy || mode !== "idle" || Boolean(answer));
+  const estadoDaJanela = !answer && (busy || mode !== "idle") ? "PROCESSANDO" : busy || mode === "speaking" ? "RESPONDENDO" : "RESPOSTA";
+  const palavrasDaResposta = falaDaResposta ? falaDaResposta.trim().split(/\s+/).length : 0;
+  const janelaDaResposta = janelaNaTela && (
+    <JanelaDaResposta key={numeroDaResposta} estado={estadoDaJanela} pergunta={question} texto={falaDaResposta || (answer ? "…" : "")}
+      digitando={busy} aoFechar={() => setJanelaFechada(true)}>
+      <FontesDaWeb fontes={fontes} />
+      {rascunhoDaResposta && (
+        <div className="bb-rascunho">
+          <div className="bb-rascunho-cabeca">Rascunho do card · ainda não gravado</div>
+          <pre>{rascunhoDaResposta}</pre>
+        </div>
+      )}
+      {ttsWaitSeconds !== null && (
+        <div className="bb-conversa-nota">Preparando a voz… {ttsWaitSeconds}s de {SPEAK_TIMEOUT_MS / 1000}s</div>
+      )}
+      {(liveCode || liveCodeDone.length > 0) && (
+        <div className="bb-codigo-ao-vivo">
+          {liveCodeDone.map((f) => <div key={f.path} style={{ color: "var(--bb-ok)", marginBottom: 6 }}>✓ {f.path}</div>)}
+          {liveCode && (
+            <div>
+              <div style={{ color: PU, marginBottom: 4 }}>✎ {liveCode.path}</div>
+              <pre>{liveCode.content.slice(-2500)}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </JanelaDaResposta>
+  );
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+      {codeTaskModal}
+      {ideDaLisa}
+      {quadroDaLisa}
+      {fullscreenOverlay}
+      {tomarNotaOverlay}
+      {cameraVigiaMessageToast}
+      {watchPreviews}
+      {radioWidget}
+      {/* Modo Interativo no desktop: sobreposição de tela cheia por cima do painel inteiro */}
+      {interactiveMode && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 240, display: "flex", flexDirection: "column", background: "var(--bb-ambiente)" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 20px", flex: "none" }}>
+            <div style={{ fontSize: 14, color: "var(--bb-texto-2)" }}>Modo interativo</div>
+            <button type="button" className="bb-menu-botao" onClick={() => setInteractiveMode(false)} title="Sair do Modo Interativo">
+              Sair
+            </button>
+          </div>
+          {interactiveScreen}
+        </div>
+      )}
+
+      <TopoExtra>
+        <Suspenso
+          titulo="Modos"
+          largura={340}
+          rotulo={
+            <>
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M2 5h7M12 5h2M2 11h2M7 11h7" /><circle cx="10.5" cy="5" r="1.6" /><circle cx="5.5" cy="11" r="1.6" /></svg>
+              <span className="bb-rotulo">Modos</span>
+              {modosLigados > 0 && <span className="bb-contador">{modosLigados}</span>}
+            </>
+          }
+        >
+          <GrupoDoMenu titulo="Percepção">
+{!usuario && (<>
+            <ChaveDoMenu
+              ligado={observanceMode}
+              onChange={() => setObservanceMode((v) => !v)}
+              detalhe="A câmera tira uma foto a cada pergunta"
+              title={observanceMode ? "Modo Observância ligado — a câmera tira 1 foto por pergunta, nada fica salvo" : "Ligar a câmera pra Lisa poder ver o que você mostra (postura, roupa, gestos) ao responder"}
+            >
+              Observância
+            </ChaveDoMenu>
+            {observanceError && <div className="bb-erro-do-menu">{observanceError}</div>}
+
+</>)}
+            <ChaveDoMenu
+              ligado={screenMode}
+              onChange={() => setScreenMode((v) => !v)}
+              detalhe="O navegador pede para escolher o que compartilhar"
+              title={screenMode ? "Modo Tela ligado — clique pra desligar" : "Compartilhar a tela pra Lisa poder ver o que está acontecendo nela"}
+            >
+              Tela
+            </ChaveDoMenu>
+            {screenMode && (
+              <div className="bb-sub-do-menu">
+                <ChaveDoMenu
+                  ligado={screenAutoComment}
+                  onChange={() => setScreenAutoComment((v) => !v)}
+                  detalhe="Só fala quando achar algo digno de nota"
+                  title={screenAutoComment ? "Vigiando sozinha — clique pra desligar" : "Deixar a Lisa de olho na tela sozinha, comentando só quando achar algo relevante"}
+                >
+                  Comentar sozinha
+                </ChaveDoMenu>
+                {screenAutoComment && (
+                  <div className="bb-campo-do-menu">
+                    <select className="bb-select" value={screenIntervalMs} onChange={(e) => chooseScreenInterval(Number(e.target.value))} title="De quanto em quanto tempo ela verifica a tela sozinha">
+                      {SCREEN_INTERVAL_OPTIONS.map((o) => <option key={o.value} value={o.value}>a cada {o.label}</option>)}
+                    </select>
+                    <input
+                      className="bb-input"
+                      value={screenFocus}
+                      onChange={(e) => updateScreenFocus(e.target.value)}
+                      placeholder="O que priorizar (ex.: avise se o build quebrar)"
+                      title="O que ela deve priorizar notar na tela — em branco, ela decide sozinha"
+                    />
+                  </div>
+                )}
+{!usuario && (<>
+                <ChaveDoMenu
+                  ligado={transmissionMode}
+                  onChange={() => setTransmissionMode((v) => !v)}
+                  detalhe="Outro aparelho no Modo Vigia assiste ao vivo"
+                  cor={OR}
+                >
+                  Transmissão
+                </ChaveDoMenu>
+</>)}
+              </div>
+            )}
+            {screenError && <div className="bb-erro-do-menu">{screenError}</div>}
+
+{!usuario && (<>
+            <ChaveDoMenu
+              ligado={micWatchMode && (screenMode || observanceMode)}
+              onChange={() => setMicWatchMode((v) => !v)}
+              disabled={!screenMode && !observanceMode}
+              detalhe={!screenMode && !observanceMode ? "Ligue a Tela ou a Observância primeiro" : "Microfone aberto, ouvindo o ambiente"}
+            >
+              Escuta
+            </ChaveDoMenu>
+            {micWatchError && <div className="bb-erro-do-menu">{micWatchError}</div>}
+
+            <ChaveDoMenu
+              ligado={cameraVigiaMode}
+              onChange={() => setCameraVigiaMode((v) => !v)}
+              detalhe="Filma com câmera e áudio para outro aparelho assistir"
+            >
+              Câmera de vigia
+            </ChaveDoMenu>
+            {cameraVigiaMode && (
+              <div className="bb-sub-do-menu">
+                <ItemDoMenu fecharAoClicar={false} onClick={() => setCameraFacing((f) => (f === "user" ? "environment" : "user"))} detalhe="Para celular">
+                  Câmera {cameraFacing === "user" ? "frontal" : "traseira"} · trocar
+                </ItemDoMenu>
+              </div>
+            )}
+            {cameraVigiaError && <div className="bb-erro-do-menu">{cameraVigiaError}</div>}
+</>)}
+          </GrupoDoMenu>
+
+{!usuario && (<>
+          <GrupoDoMenu titulo="Vigia">
+            <ChaveDoMenu
+              ligado={vigiaMode}
+              onChange={() => setVigiaMode((v) => !v)}
+              detalhe="Pergunte sobre o que a Lisa vem vendo na tela"
+              cor={OR}
+            >
+              Vigia
+            </ChaveDoMenu>
+            {vigiaMode && (
+              <div className="bb-sub-do-menu">
+                <ChaveDoMenu ligado={vigiaAutoOn} onChange={() => setVigiaAutoOn((v) => !v)} detalhe="Conta sozinha o que há de novo">
+                  Narrar sozinha
+                </ChaveDoMenu>
+                {vigiaAutoOn && (
+                  <div className="bb-campo-do-menu">
+                    <select className="bb-select" value={vigiaAutoIntervalMs} onChange={(e) => chooseVigiaAutoInterval(Number(e.target.value))} title="De quanto em quanto tempo ela verifica se há algo novo">
+                      {SCREEN_INTERVAL_OPTIONS.map((o) => <option key={o.value} value={o.value}>a cada {o.label}</option>)}
+                    </select>
+                  </div>
+                )}
+                <ChaveDoMenu
+                  ligado={vigiaWatching}
+                  onChange={() => setVigiaWatching((v) => !v)}
+                  detalhe={vigiaWatching ? (vigiaWatchStatus === "connected" ? "Ao vivo — veja o canto da tela" : vigiaWatchStatus === "procurando" ? "Procurando…" : vigiaWatchStatus || "Conectando…") : "A tela de outro aparelho, ao vivo"}
+                >
+                  Assistir tela
+                </ChaveDoMenu>
+                <ChaveDoMenu
+                  ligado={cameraWatching}
+                  onChange={() => setCameraWatching((v) => !v)}
+                  detalhe={cameraWatching ? (cameraWatchStatus === "connected" ? "Ao vivo — veja o canto da tela" : cameraWatchStatus === "procurando" ? "Procurando…" : cameraWatchStatus || "Conectando…") : "A câmera de vigia de outro aparelho"}
+                >
+                  Assistir câmera
+                </ChaveDoMenu>
+                {cameraWatching && (
+                  <div className="bb-campo-do-menu bb-campo-do-menu--linha">
+                    <input
+                      className="bb-input"
+                      value={cameraChatText}
+                      onChange={(e) => setCameraChatText(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") sendCameraChat(); }}
+                      placeholder="Mensagem para a Lisa ler lá"
+                      title="A Lisa lê essa mensagem em voz alta na tela de quem está com a Câmera de Vigia ligada"
+                    />
+                    <button type="button" className="bb-botao-pequeno" onClick={sendCameraChat}>Enviar</button>
+                  </div>
+                )}
+              </div>
+            )}
+          </GrupoDoMenu>
+
+</>)}
+          <GrupoDoMenu titulo="Voz e rádio">
+            <ChaveDoMenu
+              ligado={conversaAberta}
+              onChange={() => { unlockAudioPlayback(); acordarAudio(); setConversaAberta((v) => !v); }}
+              detalhe={conversaAberta
+                ? (conversaEstado === "respondendo" ? (isMobile ? "Respondendo… a escuta volta quando ela terminar de falar" : "Respondendo… diga \"Lisa\" para interromper") : "Pode falar — ela continua o assunto")
+                : "Microfone aberto: fale quando quiser, ela responde continuando a conversa"}
+              cor="#3fe0c5"
+            >
+              Conversa livre
+            </ChaveDoMenu>
+{!usuario && (<>
+            <ChaveDoMenu
+              ligado={radioMode}
+              onChange={() => { unlockAudioPlayback(); acordarAudio(); setRadioMode((v) => !v); }}
+              detalhe={radioMode ? "O player fica no canto inferior esquerdo" : "A Lisa vira apresentadora, com a sua playlist"}
+            >
+              Rádio
+            </ChaveDoMenu>
+</>)}
+            <ChaveDoMenu
+              ligado={escutaPalavra}
+              onChange={() => { unlockAudioPlayback(); acordarAudio(); setEscutaPalavra((v) => !v); }}
+              detalhe={escutaPalavra ? (escutaEstado === "acordada" ? "Ouvindo o comando…" : escutaEstado === "ocupada" ? "Respondendo…" : "Diga \"Lisa\" e o comando") : "Microfone aberto, reage quando você diz \"Lisa\""}
+            >
+              Palavra &quot;Lisa&quot;
+            </ChaveDoMenu>
+          </GrupoDoMenu>
+
+          <GrupoDoMenu titulo="Trabalho">
+{!usuario && (<>
+            <ChaveDoMenu
+              ligado={codeMode}
+              onChange={() => setCodeMode((v) => !v)}
+              detalhe="Toda mensagem vira pedido de mudança (branch + PR)"
+              cor={PU}
+            >
+              Modo código
+            </ChaveDoMenu>
+            {codeMode && (
+              <div className="bb-campo-do-menu">
+                <select className="bb-select" value={codeModeRepo} onChange={(e) => setCodeModeRepo(e.target.value)}>
+                  <option value="">Repositório…</option>
+                  {codeModeRepos.map((r) => <option key={r.id} value={r.full_name}>{r.full_name}</option>)}
+                </select>
+                {codeModeRepo && (
+                  <select className="bb-select" value={codeModeBranch} onChange={(e) => setCodeModeBranch(e.target.value)}>
+                    <option value="">Branch base…</option>
+                    {codeModeBranches.map((b) => <option key={b} value={b}>{b}</option>)}
+                  </select>
+                )}
+                {codeModeRepo && codeModeAvailableFiles.length > 0 && (
+                  <>
+                    <label>Arquivos fixos (até {CODE_MODE_MAX_FILES}; Ctrl+clique marca mais de um)</label>
+                    <select
+                      className="bb-select"
+                      multiple
+                      value={codeModeFiles}
+                      onChange={(e) => setCodeModeFiles(Array.from(e.target.selectedOptions).map((o) => o.value).slice(0, CODE_MODE_MAX_FILES))}
+                      style={{ height: 96 }}
+                    >
+                      {codeModeAvailableFiles.map((f) => <option key={f} value={f}>{f}</option>)}
+                    </select>
+                  </>
+                )}
+              </div>
+            )}
+            <ChaveDoMenu ligado={personaMode} onChange={() => togglePersonaMode()} detalhe="Personalidade do persona.md por cima das respostas" cor={PU}>
+              Persona
+            </ChaveDoMenu>
+            <ItemDoMenu onClick={() => setInteractiveMode((v) => !v)} detalhe="Rosto da Lisa e jogos; mostre ✌️ para chamar">
+              Modo interativo
+            </ItemDoMenu>
+</>)}
+            <ItemDoMenu onClick={() => setTomarNota((v) => v || { tema: "" })} detalhe="Escuta até 10 min e anota por assunto no Abacato">
+              Tomar nota
+            </ItemDoMenu>
+          </GrupoDoMenu>
+        </Suspenso>
+
+        <Suspenso
+          titulo="Ajustes do Assistente"
+          largura={310}
+          rotulo={<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><circle cx="8" cy="8" r="2.2" /><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4" /></svg>}
+        >
+          <GrupoDoMenu titulo="Aparência da Lisa">
+            {!usuario && (
+              <SegmentosDoMenu
+                rotulo="Aparência"
+                valor={avatarView}
+                onChange={chooseAvatarView}
+                opcoes={[
+                  { valor: "esfera", rotulo: "Visual", titulo: "Um visual que reage à voz (Esfera de pontos, Lente, Orbe, Plasma, Anel ou Rosto)" },
+                  { valor: "traditional", rotulo: "Ondas", titulo: "Visualizador de onda tradicional" },
+                  { valor: "3d", rotulo: "Avatar 3D", titulo: "Corpo em modelo 3D — arraste/belisque pra ajustar o enquadramento" },
+                ]}
+              />
+            )}
+            {avatarView === "esfera" && (
+              <div className="bb-campo-do-menu">
+                <select className="bb-select" value={visualDaLisa} onChange={(e) => escolherVisual(e.target.value)} title="O visual que fica no centro e reage à voz">
+                  {(usuario ? visuaisDoUsuario() : VISUAIS).map((v) => <option key={v.id} value={v.id}>{v.nome}</option>)}
+                </select>
+              </div>
+            )}
+            {avatarView === "esfera" && visualDaLisa === "rosto" && (
+              <>
+                <div className="bb-campo-do-menu">
+                  <select className="bb-select" value={ajustesDoRosto.cabelo} onChange={(e) => escolherAjustesDoRosto({ cabelo: e.target.value })} title="O cabelo do Rosto">
+                    {CABELOS_DO_ROSTO.map((c) => <option key={c.id} value={c.id}>Cabelo {c.nome.toLowerCase()}</option>)}
+                  </select>
+                </div>
+                <div className="bb-campo-do-menu">
+                  <select className="bb-select" value={ajustesDoRosto.paleta} onChange={(e) => escolherAjustesDoRosto({ paleta: e.target.value })} title="As cores do Rosto">
+                    {PALETAS_DO_ROSTO.map((p) => <option key={p.id} value={p.id}>Cores: {p.nome}</option>)}
+                  </select>
+                </div>
+              </>
+            )}
+            {avatarView === "esfera" && !usuario && (
+              <LinkDoMenu href="/visual" detalhe="Prévia ao vivo de cada visual, falando, ouvindo e pensando">
+                Ver os visuais da Lisa
+              </LinkDoMenu>
+            )}
+            {avatarView === "3d" && (
+              <SegmentosDoMenu
+                rotulo="Corpo 3D"
+                valor={avatarSkin}
+                onChange={chooseAvatarSkin}
+                opcoes={[
+                  { valor: "cyborg", rotulo: "Cyborg", titulo: "Corpo original (sem esqueleto, só balanço/respiração)" },
+                  { valor: "rigado", rotulo: "Rigado", titulo: "O seu modelo do Mixamo (public/models/rigado) — gestos reais por modo" },
+                ]}
+              />
+            )}
+          </GrupoDoMenu>
+          <GrupoDoMenu titulo="Voz">
+            <ChaveDoMenu ligado={voiceOn} onChange={() => { if (voiceOn) stopSpeaking(); setVoiceOn((v) => !v); }} detalhe="A Lisa fala as respostas em voz alta">
+              Falar as respostas
+            </ChaveDoMenu>
+            <ChaveDoMenu
+              ligado={geminiVoiceEnabled}
+              onChange={() => setGeminiVoiceEnabled((v) => {
+                const next = !v;
+                if (next) geminiDownUntilRef.current = 0; // reativou na mão → tenta de novo já na próxima, não espera o disjuntor
+                return next;
+              })}
+              detalhe={estadoGeminiVoz}
+              cor={geminiVoiceStatus === false ? OR : undefined}
+            >
+              Voz do Gemini
+            </ChaveDoMenu>
+            {geminiVoiceEnabled && (
+              <div className="bb-campo-do-menu">
+                <select
+                  className="bb-select"
+                  value={voiceName}
+                  onChange={(e) => {
+                    setVoiceName(e.target.value);
+                    if (typeof window !== "undefined") localStorage.setItem("voiceName", e.target.value);
+                  }}
+                  title="Voz do Gemini (a Google não documenta gênero — teste e escolha a que preferir)"
+                >
+                  {TTS_VOICES.map((v) => <option key={v.name} value={v.name}>{v.name} · {v.trait}</option>)}
+                </select>
+              </div>
+            )}
+          </GrupoDoMenu>
+        </Suspenso>
+      </TopoExtra>
+
+      <main className="bb-palco">
+        {/* a cena (01/11/2026): a Lisa mais perto e, com a resposta, a janela holográfica e os
+            hologramas em profundidade — src/components/panels/hud/ */}
+        <CenaDaLisa ativa={janelaNaTela} obterSinal={obterSinalDaEsfera} janela={janelaDaResposta}
+          dados={{ estado: estadoDaJanela, voz: voiceName, palavras: palavrasDaResposta, fontes: fontes.length }}>
+          {avatarView === "3d" ? (
+            <div style={{ position: "relative", width: "min(70vh,680px)", height: "min(70vh,680px)" }}>
+              {avatarSkin === "rigado" ? <LisaAvatarRigado mode={mode} /> : <LisaAvatar3D mode={mode} />}
+              {avatarSkin !== "rigado" && (
+                <a
+                  href="https://sketchfab.com/3d-models/android-cyborg-anime-girl-5fda47ea8ca048f7939f78da94aea54f"
+                  target="_blank" rel="noreferrer"
+                  className="bb-credito"
+                >
+                  modelo: &quot;Android Cyborg Anime Girl&quot; por lawlietrecluze · CC-BY-4.0
+                </a>
+              )}
+            </div>
+          ) : avatarView === "traditional" ? (
+            <div style={{ position: "relative", width: "min(52vh,520px)", height: "min(52vh,520px)" }}>
+              <canvas ref={canvasRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} />
+            </div>
+          ) : (
+            <VisualDaLisa modo={visualDaLisa} obterSinal={obterSinalDaEsfera} zoom={1.2} brincadeiras />
+          )}
+        </CenaDaLisa>
+
+        <RotuloDaVoz obterSinal={obterSinalDaEsfera} />
+
+        {autoListening && <div className="bb-pode-falar">Pode falar</div>}
+        {conversaAberta && !autoListening && (
+          <button type="button" className="bb-conversa-aberta" onClick={() => setConversaAberta(false)} title="Encerrar a conversa livre">
+            <i />{conversaEstado === "respondendo" ? "Respondendo · diga \"Lisa\" para interromper" : "Conversa aberta · pode falar"}<span>encerrar</span>
+          </button>
+        )}
+
+        {!janelaNaTela && !answer && (
+          <section className="bb-conversa" aria-live="polite">
+            <p className="bb-conversa-resposta bb-conversa-resposta--vazia">Pergunte alguma coisa, por texto ou pelo microfone.</p>
+          </section>
+        )}
+
+        {/* prévias do que a câmera e a tela estão vendo — sempre montadas enquanto o modo estiver
+            ligado: a captura de cada pergunta lê destes mesmos <video> */}
+        {(observanceMode || screenMode || cameraVigiaMode) && (
+          <div className="bb-previas">
+            {observanceMode && (
+              <figure>
+                <video ref={observanceVideoRef} autoPlay playsInline muted title="o que a câmera vê agora — só uma foto disso é enviada, no instante de cada pergunta" />
+                <figcaption>Câmera</figcaption>
+              </figure>
+            )}
+            {screenMode && (
+              <figure>
+                <video ref={screenVideoRef} autoPlay playsInline muted title="o que está sendo compartilhado — só um retrato disso é enviado por vez" />
+                <figcaption>Tela{transmissionMode ? " · ao vivo" : ""}</figcaption>
+              </figure>
+            )}
+            {cameraVigiaMode && (
+              <figure>
+                <video
+                  ref={cameraVigiaVideoRef} autoPlay playsInline muted
+                  onLoadedMetadata={(e) => addLog("[CÂMERA]", GR, `preview carregado: ${e.target.videoWidth}x${e.target.videoHeight}`)}
+                  onError={() => addLog("[CÂMERA]", OR, "preview: erro ao decodificar o vídeo")}
+                  title="o que a câmera de vigia está vendo"
+                />
+                <figcaption>Vigia</figcaption>
+              </figure>
+            )}
+          </div>
+        )}
+
+        <button type="button" className="bb-aba-lateral bb-aba-lateral--esq" aria-expanded={gaveta === "registro"} onClick={() => setGaveta((g) => (g === "registro" ? null : "registro"))}>
+          Registro
+        </button>
+        <button type="button" className="bb-aba-lateral bb-aba-lateral--dir" aria-expanded={gaveta === "contexto"} onClick={() => setGaveta((g) => (g === "contexto" ? null : "contexto"))}>
+          Contexto{cards.length ? ` · ${cards.length}` : ""}
+        </button>
+
+        {gaveta === "registro" && (
+          <aside className="bb-gaveta bb-gaveta--esq" aria-label="Registro">
+            <header>Registro<button type="button" aria-label="Fechar registro" onClick={() => setGaveta(null)}>×</button></header>
+            <div className="bb-gaveta-registro">
+              {logs.map((log) => (
+                <div key={log.id} className="bb-registro-linha">
+                  <time>{log.t}</time>
+                  <span style={{ color: log.color }}>{log.tag}</span>
+                  <span>{log.msg}</span>
+                </div>
+              ))}
+              {logs.length === 0 && <div className="bb-gaveta-vazia">Nada registrado ainda.</div>}
+            </div>
+          </aside>
+        )}
+        {gaveta === "contexto" && (
+          <aside className="bb-gaveta bb-gaveta--dir" aria-label="Contexto da resposta">
+            <header>Contexto da resposta<button type="button" aria-label="Fechar contexto" onClick={() => setGaveta(null)}>×</button></header>
+            {cards.length === 0 && <div className="bb-gaveta-vazia">Os cards e notas usados na resposta aparecem aqui depois da primeira pergunta.</div>}
+            {cards.map((c, i) => {
+              const cor = c.source === "BRAIN" ? PU : c.source === "SENTINELA" ? OR : CY;
+              return (
+                <article key={i} className="bb-cartao-contexto">
+                  <div className="bb-cartao-contexto-topo">
+                    <span style={{ color: cor }}>{c.source}</span>
+                    <span>{c.board}</span>
+                  </div>
+                  <b>{c.title}</b>
+                  {c.snippet && <p>{c.snippet}</p>}
+                  <div className="bb-cartao-contexto-pe">
+                    <span title="similaridade com a pergunta">{c.sim}</span>
+                    <span>{c.modified}</span>
+                  </div>
+                </article>
+              );
+            })}
+          </aside>
+        )}
+      </main>
+
+      <footer className="bb-pe">
+        <div className="bb-pe__coluna">
+        {faixaDoContexto}
+        <div className="bb-campo-de-mensagem">
+          <BotaoMais aoEscolherImagens={anexarImagens} aoVincular={vincularRepo} desabilitado={busy} />
+{!usuario && (<>
+          <Suspenso
+            titulo="Perguntar sobre"
+            paraCima
+            lado="esquerda"
+            largura={300}
+            classeDoBotao="bb-escopo"
+            rotulo={<>{nomeDoEscopo}<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M2 4l3 3 3-3" /></svg></>}
+          >
+            <GrupoDoMenu titulo="Perguntar sobre">
+              <SegmentosDoMenu
+                rotulo="Escopo"
+                valor={scopeMode}
+                onChange={setScopeMode}
+                opcoes={[{ valor: "panel", rotulo: "Um painel" }, { valor: "general", rotulo: "Geral" }]}
+              />
+              {scopeMode === "general" ? (
+                <div className="bb-nota-do-menu">Vê todos os painéis e pode buscar na web quando precisar.</div>
+              ) : (
+                <div className="bb-campo-do-menu">
+                  <select className="bb-select" value={scopePanel} onChange={(e) => setScopePanel(e.target.value)}>
+                    {panelOptions.map((b) => <option key={b} value={b}>{b}</option>)}
+                    <option value={TASKS_SCOPE}>Tarefas (por prazo)</option>
+                    <option value={THOUGHTS_SCOPE}>Pensamentos</option>
+                    <option value={SENTINEL_SCOPE}>Chamados (Sentinela)</option>
+                    <option value={WORK_SCOPE}>Tarefas do trabalho</option>
+                    <option value={CODE_SCOPE}>Código</option>
+                  </select>
+                  {scopePanel === SENTINEL_SCOPE && (
+                    <select className="bb-select" value={sentinelProjectId} onChange={(e) => setSentinelProjectId(e.target.value)} title="Projeto de teste (Sentinela) — força a resposta a considerar só esse projeto">
+                      <option value="all">Todos os projetos</option>
+                      {sentinelProjects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                    </select>
+                  )}
+                  {scopePanel === CODE_SCOPE && (
+                    <select className="bb-select" value={codeRepo} onChange={(e) => setCodeRepo(e.target.value)} title="Repositório — força a resposta a considerar só esse repo">
+                      <option value="all">Todos os repositórios</option>
+                      {codeRepos.map((r) => <option key={r.id} value={r.full_name}>{r.full_name}</option>)}
+                    </select>
+                  )}
+                  {scopePanel === CODE_SCOPE && codeRepo !== "all" && (
+                    <select className="bb-select" value={codeFile} onChange={(e) => setCodeFile(e.target.value)} title="Arquivo específico — sem escolher nenhum, busca no repositório inteiro">
+                      <option value="">Repositório inteiro</option>
+                      {codeFiles.map((f) => <option key={f} value={f}>{f}</option>)}
+                    </select>
+                  )}
+                </div>
+              )}
+            </GrupoDoMenu>
+          </Suspenso>
+</>)}
+
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") enviarPergunta(); }}
+            disabled={busy}
+            placeholder={busy ? "Pensando…" : listening ? "Ouvindo… pode falar" : "Pergunte alguma coisa para a Lisa"}
+            aria-label="Mensagem para a Lisa"
+          />
+
+          <button
+            type="button"
+            className="bb-redondo"
+            onClick={() => { if (voiceOn) stopSpeaking(); setVoiceOn((v) => !v); }}
+            title={voiceOn ? "Voz ligada (clique para mutar)" : "Voz desligada (clique para ligar)"}
+            aria-pressed={voiceOn}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+              {voiceOn
+                ? <><path d="M15.54 8.46a5 5 0 0 1 0 7.07" /><path d="M19.07 4.93a10 10 0 0 1 0 14.14" /></>
+                : <><line x1="22" y1="9" x2="16" y2="15" /><line x1="16" y1="9" x2="22" y2="15" /></>}
+            </svg>
+          </button>
+          <button
+            type="button"
+            className={`bb-redondo bb-redondo--mic${listening || conversaAberta ? " bb-redondo--ouvindo" : ""}`}
+            onClick={() => { acordarAudio(); toggleMic(); }}
+            disabled={busy && !conversaAberta}
+            title={conversaAberta ? "Encerrar a conversa livre" : listening ? "Parar de ouvir" : "Falar (microfone)"}
+            aria-pressed={listening || conversaAberta}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="9" y="2.5" width="6" height="12" rx="3" />
+              <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" />
+            </svg>
+          </button>
+          <button type="button" className="bb-redondo bb-redondo--enviar" onClick={enviarPergunta} disabled={busy || !input.trim()} title="Enviar">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6" /></svg>
+          </button>
+        </div>
+        </div>
+      </footer>
+    </div>
+  );
+}

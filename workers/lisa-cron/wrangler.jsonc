@@ -1,0 +1,43 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lisa-cron",
+  "main": "src/index.js",
+
+  // Trava o comportamento da plataforma numa data. Sem isso, uma mudança futura da Cloudflare
+  // poderia alterar o runtime debaixo de um deploy que já funcionava.
+  "compatibility_date": "2026-09-13",
+
+  // É esta linha que faz o web-push funcionar aqui — e foi justamente ela que não bastou
+  // enquanto as rotas rodavam em Edge runtime, que não tem http/https/net.
+  "compatibility_flags": ["nodejs_compat"],
+
+  // DESLIGADO por padrão: quem tem um servidor local pode agendar por lá (crontab, ver
+  // servidor/relogio-local.mjs). Para agendar pela Cloudflare, ponha os horários aqui, por exemplo
+  // ["*/10 * * * *"]. Por que o servidor local costuma ser melhor:
+  //
+  //  - o servidor local chama a Lisa em localhost, sem as duas travessias de internet por chamada;
+  //  - não existe teto de 50 chamadas de saída por invocação, então o download do GitHub
+  //    deixa de ser fatiado em 35 arquivos;
+  //  - não existe teto de tempo, então o ciclo avança até o fim em vez de 5 fatias por vez.
+  //
+  // Medido: 720 pedaços em 90 segundos aqui, contra cerca de 300 por HORA pelo Worker.
+  //
+  // A lista vazia é necessária: apagar a seção inteira faria o wrangler MANTER os horários
+  // antigos, e aí tudo rodaria em dobro.
+  //
+  // O Worker continua publicado, com o handler de `fetch`, para dar pra disparar na mão e para
+  // ser fácil religar se um dia o servidor de casa sair de cena.
+  "triggers": {
+    "crons": []
+  },
+
+  // O endereço da Lisa. Os horários dos crons acima são em UTC.
+  //
+  // Aponta para o domínio próprio, e não para o .workers.dev, de propósito: o dia em que aquele
+  // endereço for desligado, este Worker pararia de sincronizar sem erro nenhum visível — ele roda
+  // no horário, a chamada falha, e o log fica num lugar que ninguém olha.
+  // Troque pelo endereço da SUA Lisa antes de publicar este Worker.
+  "vars": { "LISA_URL": "https://lisa.seudominio.com" },
+
+  "observability": { "enabled": true }
+}

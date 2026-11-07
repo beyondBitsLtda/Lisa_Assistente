@@ -1,0 +1,438 @@
+import { embedOne } from "./gemini.js";
+import { supabase } from "./supabase.js";
+import { loadAllCards } from "./liveQuadros.js";
+import { fonteDosQuadros } from "./configLisa.js";
+import { getPersonaText } from "./persona.js";
+import { getContextDocsText } from "./context.js";
+import { secaoDaConversa } from "./conversa.js";
+
+const TOP_K = Number(process.env.RAG_TOP_K || 8);
+const MIN_SIM = Number(process.env.RAG_MIN_SIMILARITY || 0.55);
+
+/** Detecta perguntas do tipo "liste tudo" para buscar mais resultados. */
+function wantsMany(question) {
+  const q = question.toLowerCase();
+  return /\b(todas|todos|liste|listar|lista|quais s[ãa]o|me diga tudo|tudo que|completa|completo)\b/.test(q);
+}
+
+/** Persona da Lisa — instrução de sistema do Gemini. */
+export const SYSTEM_INSTRUCTION = `Você é a "Lisa", assistente pessoal do usuário (estilo J.A.R.V.I.S.).
+Esse é o seu nome — aceite ser chamada assim e apresente-se como Lisa sempre que o usuário
+cumprimentar (ex.: "oi", "olá") ou perguntar quem você é. Nunca se refira a si mesma como
+"Cérebro" — esse é só o nome do banco de notas do usuário, não o seu nome.
+Responda em português do Brasil, de forma direta e objetiva.
+
+O sistema de tarefas do usuário é o ABACATO (quadros, colunas e cards).
+Quando ele falar de tarefas, cards, quadros ou do "Abacato", é disso que se trata. Não fale em
+Trello: ele não é mais usado para as tarefas.
+
+Baseie-se SOMENTE no contexto fornecido (cards do Abacato, notas do Cérebro, e chamados
+de suporte do Sentinela — este último identificado por source "SENTINELA" no contexto).
+Se a resposta não estiver no contexto, diga claramente que não encontrou nos dados indexados.
+
+Quando o usuário pedir para "ler", "mostrar" ou "falar" uma nota/pensamento ou um chamado
+específico, reproduza o conteúdo dela de forma completa e fiel — é uma LEITURA, não um resumo.
+Se houver mais de um item parecido no contexto, leia o que combina melhor com o pedido; se não
+tiver certeza de qual é, pergunte qual antes de ler, ou descreva rapidamente as opções.
+
+Sobre datas:
+- Cada card do Abacato pode ter "Data de entrega/prazo", "Data de início" e "Última modificação".
+- Quando o usuário perguntar sobre prazos, entregas, "hoje", "esta semana", "atrasadas", use "Data de entrega/prazo".
+- Considere a data atual ao interpretar "hoje", "amanhã", "essa semana" etc.
+- "Última modificação" NÃO é prazo — é só quando o card foi editado por último.
+- Chamados do Sentinela têm SLA de resposta e de resolução; quando "[SLA estourado]" aparecer
+  no contexto do chamado, avise disso claramente — é informação urgente.
+
+Se a pergunta for ampla (ex.: "quais chamados estão abertos", "quantos chamados tem", "como
+estão as tarefas") e o contexto trouxer itens de MAIS DE UM board/projeto, cubra todos os
+boards/projetos representados no contexto, não só o primeiro — mesmo que de forma resumida por
+grupo ("no CRM você tem X chamados abertos; no Quarto de Guerra, Y..."). Nunca ignore
+um board/projeto só porque ele tem menos itens ou aparece depois no contexto.
+
+Formato da resposta (importante — será lida em voz alta):
+- Escreva em frases curtas e naturais, como se estivesse FALANDO com a pessoa.
+- Evite listas com marcadores, asteriscos, numeração "1." "2.", tabelas e símbolos.
+- Em vez de bullets, encadeie os itens em frases: "Você tem três tarefas hoje: a primeira é..., depois..., e por fim...".
+- Não use markdown (nada de **negrito**, #, -, etc.).
+- Datas por extenso ("sexta-feira, 8 de agosto") em vez de "08/08".
+
+Priorize itens com prazo mais próximo ou modificados mais recentemente quando relevante.
+Cite o board de origem quando ajudar.
+
+SOBRE MEXER NOS CARDS DO ABACATO — você PODE criar, editar (título, descrição, prazo),
+concluir, reabrir, mover e excluir cards do Abacato: isso é feito pelo sistema de ações da Lisa,
+que roda ANTES desta resposta e pede um "Confirma?" antes de gravar. Nunca diga que não tem
+permissão ou acesso para isso. Se o usuário pediu uma dessas ações e você está gerando ESTA
+resposta, é porque o pedido não foi reconhecido: NUNCA diga que "criou", "atualizou", "mudou",
+"moveu", "concluiu" ou "excluiu" algo (seria mentira). Diga que não entendeu exatamente o que
+fazer e peça para repetir citando o nome do card (e o quadro, se for para criar).`;
+
+/** Persona do modo "Geral" — mesma base, mas autorizada a usar busca do Google quando o contexto indexado não basta. */
+export const SYSTEM_INSTRUCTION_GENERAL = `Você é a "Lisa", assistente pessoal do usuário (estilo J.A.R.V.I.S.), agora em modo GERAL.
+Esse é o seu nome — aceite ser chamada assim e apresente-se como Lisa sempre que o usuário
+cumprimentar ou perguntar quem você é. Nunca se refira a si mesma como "Cérebro" — esse é
+só o nome do banco de notas do usuário, não o seu nome.
+Responda em português do Brasil, de forma direta e objetiva.
+
+O sistema de tarefas do usuário é o ABACATO (quadros, colunas e cards).
+Quando ele falar de tarefas, cards, quadros ou do "Abacato", é disso que se trata. Não fale em
+Trello: ele não é mais usado para as tarefas.
+
+Neste modo você enxerga um recorte amplo de TODOS os dados indexados (Abacato + notas do Cérebro
++ chamados de suporte do Sentinela, identificados por source "SENTINELA"), não só um board
+específico. Priorize sempre esse contexto indexado como fonte principal.
+
+A internet entra quando o usuário pede para pesquisar ou cita um site: aí os resultados e o texto
+das páginas vêm junto da pergunta (ver src/lib/buscaNaWeb.js). Quando vierem, use-os e deixe claro
+que essa parte veio da internet, não dos seus dados. Se a pergunta precisar de informação atual ou
+externa (notícias, preços, prazos legais) e nada da internet vier junto, NÃO diga que pesquisou:
+responda com o que sabe, avise que pode estar desatualizado e ofereça pesquisar ("quer que eu pesquise?").
+Se nem o contexto indexado nem a internet resolverem, diga claramente que não encontrou.
+
+Quando o usuário pedir para "ler", "mostrar" ou "falar" uma nota/pensamento ou um chamado
+específico, reproduza o conteúdo dele de forma completa e fiel — é uma LEITURA, não um resumo.
+Chamados com "[SLA estourado]" no contexto são urgentes — avise disso claramente.
+
+Se a pergunta for ampla e o contexto trouxer itens de MAIS DE UM board/projeto, cubra todos os
+representados no contexto, não só o primeiro — mesmo que de forma resumida por grupo.
+
+Sobre datas:
+- Cada card do Abacato pode ter "Data de entrega/prazo", "Data de início" e "Última modificação".
+- Considere a data atual ao interpretar "hoje", "amanhã", "essa semana" etc.
+- "Última modificação" NÃO é prazo — é só quando o card foi editado por último.
+
+Formato da resposta (importante — será lida em voz alta):
+- Escreva em frases curtas e naturais, como se estivesse FALANDO com a pessoa.
+- Evite listas com marcadores, asteriscos, numeração "1." "2.", tabelas e símbolos.
+- Não use markdown (nada de **negrito**, #, -, etc.).
+- Datas por extenso ("sexta-feira, 8 de agosto") em vez de "08/08".
+
+SOBRE MEXER NOS CARDS DO ABACATO — você PODE criar, editar (título, descrição, prazo),
+concluir, reabrir, mover e excluir cards do Abacato: isso é feito pelo sistema de ações da Lisa,
+que roda ANTES desta resposta e pede um "Confirma?" antes de gravar. Nunca diga que não tem
+permissão ou acesso para isso. Se o usuário pediu uma dessas ações e você está gerando ESTA
+resposta, é porque o pedido não foi reconhecido: NUNCA diga que "criou", "atualizou", "mudou",
+"moveu", "concluiu" ou "excluiu" algo (seria mentira). Diga que não entendeu exatamente o que
+fazer e peça para repetir citando o nome do card (e o quadro, se for para criar).`;
+
+/**
+ * Aplica a personalidade de persona.md (raiz do repo) por cima de uma instrução base — só
+ * quando o usuário liga "Modo Persona" no seletor do Assistente (padrão é desligado, com o
+ * tom direto/neutro de sempre). O tom/humor descrito em persona.md é uma CAMADA por cima do
+ * conteúdo — nunca substitui as regras de formato/precisão da instrução base, só as combina.
+ */
+export function withPersona(baseInstruction, personaMode) {
+  if (!personaMode) return baseInstruction;
+  const persona = getPersonaText();
+  if (!persona.trim()) return baseInstruction;
+  return `${baseInstruction}
+
+---
+MODO PERSONA ATIVADO — o usuário ligou isso explicitamente nas configurações do Assistente.
+Incorpore o estilo/personalidade descritos abaixo nas suas respostas, MANTENDO todas as
+regras acima (formato pra fala, basear-se só no contexto, nunca afirmar que executou uma
+ação que não executou). O tom da persona é uma camada por cima do conteúdo certo — nunca em
+troca de precisão ou clareza; se a personalidade e a precisão conflitarem, precisão vence.
+
+${persona}`;
+}
+
+/**
+ * Acrescenta os arquivos de contexto pessoal (contexto/*.md — ex.: sobre-mim.md, com nome,
+ * família, carreira do usuário) à instrução de sistema. Ao contrário de withPersona (que só
+ * entra com o Modo Persona ligado), isso é SEMPRE aplicado, incondicional — o usuário pediu
+ * explicitamente que a Lisa "sempre leve em conta" esse contexto, sem precisar ligar nada.
+ */
+export function withContextDocs(baseInstruction) {
+  const text = getContextDocsText();
+  if (!text.trim()) return baseInstruction;
+  return `${baseInstruction}
+
+---
+CONTEXTO PESSOAL DO USUÁRIO (sempre vale, não precisa mencionar isso explicitamente a menos
+que seja relevante pra pergunta) — arquivos abaixo de contexto/*.md:
+
+${text}`;
+}
+
+/**
+ * A fonte que está valendo já tem alguma coisa indexada?
+ *
+ * Uma contagem por pergunta seria desperdício: a resposta muda uma vez por migração, e não a
+ * cada busca. Cinco minutos de cache é curto o bastante para a primeira fatia de indexação
+ * ligar o descarte quase na hora, e longo o bastante para o banco nem sentir.
+ */
+let _indiceDaFonte = null; // { em: number, fonte: string, tem: boolean }
+
+async function fonteAtivaTemIndice() {
+  const fonte = await fonteDosQuadros();
+  if (_indiceDaFonte && _indiceDaFonte.fonte === fonte && Date.now() - _indiceDaFonte.em < 300000) {
+    return _indiceDaFonte.tem;
+  }
+  const { count, error } = await supabase
+    .from("documents").select("id", { count: "exact", head: true }).eq("source", fonte);
+  // Banco arisco: na dúvida, NÃO descarta. Perder resultado por causa de uma consulta que
+  // falhou seria trocar um problema pequeno por um grande.
+  const tem = error ? true : (count || 0) > 0;
+  _indiceDaFonte = { em: Date.now(), fonte, tem };
+  return tem;
+}
+
+/**
+ * Recupera os trechos mais parecidos com a pergunta.
+ * Retorna um array já no formato dos cards do HUD.
+ */
+// cache simples de embeddings de perguntas (economiza quota em repetições)
+const _queryCache = new Map();
+const _cacheKey = (q) => q.trim().toLowerCase().replace(/\s+/g, " ");
+
+export async function retrieve(question, { filterSource = null, filterBoard = null, topK = null, minSim = null } = {}) {
+  const key = _cacheKey(question);
+  let queryEmbedding = _queryCache.get(key);
+  if (!queryEmbedding) {
+    queryEmbedding = await embedOne(question, "RETRIEVAL_QUERY");
+    _queryCache.set(key, queryEmbedding);
+    if (_queryCache.size > 100) _queryCache.delete(_queryCache.keys().next().value);
+  }
+
+  // topK/minSim explícitos (ex.: modo "Geral") vencem a heurística padrão.
+  const matchCount = topK ?? (wantsMany(question) ? 30 : TOP_K);
+  const minSimilarity = minSim ?? (wantsMany(question) ? 0.3 : MIN_SIM); // mais permissivo ao listar
+
+  const { data, error } = await supabase.rpc("match_documents", {
+    query_embedding: queryEmbedding,
+    match_count: matchCount,
+    min_similarity: minSimilarity,
+    filter_source: filterSource,
+    filter_board: filterBoard,
+  });
+  if (error) throw new Error(`match_documents: ${error.message}`);
+
+  // O índice guarda documentos das DUAS fontes de quadro: quem migrou tem as duas coisas
+  // indexadas, e apagar a antiga seria jogar fora a única cópia do que existia antes. Então a
+  // fonte que não está valendo é descartada aqui, na leitura — senão a Lisa responderia
+  // misturando as tarefas de hoje com as de um sistema que ninguém usa mais.
+  //
+  // COM UMA EXCEÇÃO, e ela é o dia da migração. Indexar custa embedding, que é cota do Gemini
+  // e acaba: virar o interruptor de manhã e ficar sem cota até a meia-noite do Pacífico é
+  // normal. Se a fonte nova ainda não tem NADA indexado, descartar a antiga deixaria a busca
+  // por significado completamente cega — e um texto de ontem sobre a mesma tarefa é muito
+  // melhor que silêncio. O descarte só começa quando há o que descartar em favor de quê.
+  const inativa = (await fonteDosQuadros()) === "abacato" ? "TRELLO" : "ABACATO";
+  const podeDescartar = await fonteAtivaTemIndice();
+
+  return (data || [])
+    .filter((row) => !podeDescartar || String(row.source || "").toUpperCase() !== inativa)
+    .map((row) => ({
+    id: String(row.external_id || "").split("#")[0],
+    source: (row.source || "").toUpperCase(),
+    board: row.board || "",
+    title: row.title || "(sem título)",
+    snippet: shorten(row.content, 180),
+    content: row.content,
+    sim: Number(row.similarity || 0).toFixed(2),
+    pct: Math.round((row.similarity || 0) * 100),
+    last_modified: row.last_modified,
+    modified: relTime(row.last_modified),
+  }));
+}
+
+/**
+ * Busca ampla, sem filtro de board/source — usada pelo modo "Geral" do assistente,
+ * que precisa enxergar tudo que está indexado (todos os boards + Cérebro),
+ * não só o que uma busca padrão (top_k pequeno) traria.
+ */
+export async function retrieveGeneral(question) {
+  return retrieve(question, { topK: 40, minSim: 0.25 });
+}
+
+/** Data de hoje por extenso, em português — compartilhada entre o prompt do RAG e a
+ * detecção de ações do Assistente (ver detectTrelloAction em gemini.js). */
+export function todayLabel() {
+  return new Intl.DateTimeFormat("pt-BR", {
+    weekday: "long", day: "2-digit", month: "long", year: "numeric",
+    timeZone: "America/Sao_Paulo",
+  }).format(new Date());
+}
+
+/**
+ * Monta o prompt final: bloco de contexto + pergunta + data de hoje.
+ * `note` (opcional) — linha extra de contexto ativo, ex.: qual projeto do Sentinela foi
+ * selecionado manualmente no seletor de escopo (ver src/app/(panels)/assistant/page.js).
+ * `extra` (opcional) — uma seção pronta que entra antes da pergunta, ex.: o código da conversa
+ * (secaoDoCodigoDaConversa em src/lib/codigoNaResposta.js).
+ */
+export function buildPrompt(question, matches, note = null, conversa = "", extra = "") {
+  const hoje = todayLabel();
+
+  const context = matches.length
+    ? matches
+        .map(
+          (m, i) =>
+            `[#${i + 1} · ${m.source} · ${m.board} · sim ${m.sim} · ${m.modified}]\n${m.title}\n${m.content}`
+        )
+        .join("\n\n---\n\n")
+    : "(nenhum contexto relevante encontrado)";
+
+  const noteBlock = note ? `\n\nCONTEXTO ATIVO: ${note}` : "";
+
+  return `DATA DE HOJE: ${hoje}${noteBlock}\n\nCONTEXTO RECUPERADO:\n${context}${secaoDaConversa(conversa)}${extra || ""}\n\nPERGUNTA DO USUÁRIO:\n${question}\n\nResponda usando o contexto acima.`;
+}
+
+// ---------- roteamento por board/projeto ----------
+
+// Os quadros que a pessoa cita pelo apelido ("o que tem no quarto?" → "Quarto de Guerra"). Vêm de
+// LISA_APELIDOS_DE_QUADRO: cada quadro separado por ";", o nome exato depois do "=", e os apelidos
+// separados por "," antes dele. A ordem conta: ponha os mais específicos primeiro.
+//   LISA_APELIDOS_DE_QUADRO="quarto de guerra,quarto=Quarto de Guerra;crm acompanhamento=CRM - Acompanhamento;crm=CRM"
+// Sem a variável, nenhum apelido: a busca normal (por semelhança) continua achando os cards.
+const escaparRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** [{ match: RegExp, board }] a partir de LISA_APELIDOS_DE_QUADRO. */
+export function apelidosDeQuadro(texto = process.env.LISA_APELIDOS_DE_QUADRO) {
+  return String(texto || "")
+    .split(";")
+    .map((item) => {
+      const [apelidos, board] = item.split("=").map((s) => (s || "").trim());
+      const lista = (apelidos || "").split(",").map((a) => a.trim()).filter(Boolean);
+      if (!board || !lista.length) return null;
+      // "quarto de guerra" casa com "quarto de guerra", "quartodeguerra" e "Quarto  de Guerra"
+      const corpo = lista.map((a) => escaparRegex(a).replace(/\s+/g, "\\s*")).join("|");
+      return { match: new RegExp(`(?<![\\p{L}\\p{N}])(?:${corpo})(?![\\p{L}\\p{N}])`, "iu"), board };
+    })
+    .filter(Boolean);
+}
+
+/** Detecta se a pergunta cita um board conhecido. Retorna o nome exato ou null. */
+export function detectBoard(question) {
+  for (const { match, board } of apelidosDeQuadro()) {
+    if (match.test(question)) return board;
+  }
+  return null;
+}
+
+/**
+ * Busca TODOS os cards de um board — direto do Trello (ao vivo, sem SYNC/embeddings).
+ * Preciso e completo — traz o board inteiro, sempre atual.
+ */
+export async function retrieveByBoard(boardName, { onlyOpen = false } = {}) {
+  const fonte = await fonteDosQuadros();
+  const all = await loadAllCards();
+  const lowerName = boardName.toLowerCase();
+
+  const seen = new Map();
+  for (const card of all) {
+    if ((card.board || "").toLowerCase() !== lowerName) continue;
+    if (onlyOpen && card.due_complete) continue;
+    seen.set(card.id, {
+      id: card.id,
+      source: fonte.toUpperCase(),
+      board: card.board,
+      title: card.title,
+      snippet: shorten(card.content, 180),
+      content: card.content,
+      sim: "—",
+      pct: 100,
+      last_modified: card.last_modified,
+      modified: relTime(card.last_modified),
+      due: card.due,
+      start: card.start,
+      list: card.list,
+      list_pos: card.list_pos,
+      labels: card.labels,
+      due_complete: card.due_complete,
+      url: card.url,
+    });
+  }
+  // ordena pela ordem real das listas no board (list_pos; sem pos ainda → fallback alfabético) e depois por prazo
+  return [...seen.values()].sort((a, b) => {
+    if (a.list_pos == null && b.list_pos != null) return 1;
+    if (a.list_pos != null && b.list_pos == null) return -1;
+    if (a.list_pos == null && b.list_pos == null) {
+      const byList = (a.list || "").localeCompare(b.list || "");
+      if (byList) return byList;
+    } else if (a.list_pos !== b.list_pos) {
+      return a.list_pos - b.list_pos;
+    }
+    return (a.due || "").localeCompare(b.due || "");
+  });
+}
+
+// ---------- roteamento por data ----------
+
+/** Detecta se a pergunta é sobre PRAZO/DATA (hoje, semana, atrasadas…). */
+export function detectDateRange(question) {
+  const q = question.toLowerCase();
+  if (/\b(atrasad|venceu|passou do prazo|em atraso|vencid)/.test(q)) return "overdue";
+  if (/\b(amanh[ãa])/.test(q)) return "tomorrow";
+  if (/\b(esta semana|essa semana|na semana|semana que|pr[óo]ximos dias|pr[óo]xima semana)/.test(q)) return "week";
+  if (/\b(hoje|do dia|para o dia|de hoje)/.test(q)) return "today";
+  return null; // não é pergunta de data → usa RAG normal
+}
+
+/**
+ * Busca tarefas do Trello filtrando pela data de vencimento — direto do Trello (ao vivo,
+ * sem SYNC/embeddings). Retorna no MESMO formato dos matches do RAG, p/ o HUD renderizar igual.
+ */
+export async function retrieveByDate(range) {
+  const fonte = await fonteDosQuadros();
+  const now = new Date();
+  const spNow = new Date(now.toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
+  const y = spNow.getFullYear(), mo = spNow.getMonth(), d = spNow.getDate();
+  const startToday = new Date(Date.UTC(y, mo, d, 3, 0, 0)); // 00:00 BRT
+  const endToday = new Date(startToday.getTime() + 864e5);
+  const endTomorrow = new Date(endToday.getTime() + 864e5);
+  const endWeek = new Date(startToday.getTime() + 7 * 864e5);
+
+  let lo = null, hi = null, onlyOpen = false;
+  if (range === "today") { lo = startToday; hi = endToday; }
+  else if (range === "tomorrow") { lo = endToday; hi = endTomorrow; }
+  else if (range === "week") { lo = startToday; hi = endWeek; }
+  else if (range === "overdue") { hi = startToday; onlyOpen = true; }
+
+  const all = await loadAllCards();
+
+  const seen = new Map();
+  for (const card of all) {
+    if (!card.due) continue;
+    if (onlyOpen && card.due_complete) continue;
+    const due = new Date(card.due);
+    if (lo && due < lo) continue;
+    if (hi && due >= hi) continue;
+    seen.set(card.id, {
+      id: card.id,
+      source: fonte.toUpperCase(),
+      board: card.board,
+      title: card.title,
+      snippet: shorten(card.content, 180),
+      content: card.content,
+      sim: "—",
+      pct: 100,
+      last_modified: card.last_modified,
+      modified: relTime(card.last_modified),
+      due: card.due,
+    });
+  }
+  return [...seen.values()].sort((a, b) => (a.due || "").localeCompare(b.due || ""));
+}
+
+// ---------- helpers ----------
+// exportados pra reuso em notes.js (formato de card do Pensamentos combina com o do RAG)
+export function shorten(text, n) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+
+export function relTime(iso) {
+  if (!iso) return "—";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "—";
+  const diff = Math.max(0, Date.now() - then);
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return "agora";
+  if (min < 60) return `há ${min} min`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `há ${h} h`;
+  const d = Math.floor(h / 24);
+  return `há ${d} d`;
+}

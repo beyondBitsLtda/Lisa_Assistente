@@ -1,0 +1,43 @@
+node_modules
+
+# segredos — nunca commitar (use o .env.example como modelo)
+.env
+.env.local
+.env*.local
+!.env.example
+
+# Segredos do `wrangler dev` — mesmo papel do .env, formato do wrangler.
+.dev.vars
+.dev.vars.*
+
+# build do Next.js e do adaptador da Cloudflare
+.next
+out
+.open-next/
+.vercel/
+
+# Artefatos do wrangler. NÃO é só lixo de build: os bundles de `wrangler dev` em .wrangler/tmp/
+# trazem as variáveis de ambiente EMBUTIDAS no código (chave de serviço do Supabase e chaves do
+# Gemini em texto puro). Nunca versione esta pasta.
+.wrangler/
+
+# outros
+*.log
+.DS_Store
+
+# ---- o que é SEU e não deve ir para um repositório público ----
+
+# Contexto pessoal: todo contexto/*.md entra nas instruções da Lisa. Só o modelo é versionado.
+# (Se o seu repositório for privado e você quiser versionar o seu contexto, apague estas linhas.)
+contexto/*.md
+!contexto/_exemplo.md
+
+# Planilhas de tarefas do trabalho (a tela /work-tasks lê no navegador e grava no Supabase;
+# o arquivo não precisa — e não deveria — ser versionado).
+contexto/*.xlsx
+contexto/*.xls
+*.xlsx
+
+# O seu modelo 3D rigado (ver public/models/rigado/LEIA-ME.txt): use só modelos que você tenha
+# o direito de distribuir antes de tirar esta linha.
+public/models/rigado/*.fbx

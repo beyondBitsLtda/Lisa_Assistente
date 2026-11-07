@@ -1,0 +1,33 @@
+import { runLisaCodeTurn } from "@/lib/gemini.js";
+import { jsonResponse } from "@/lib/http.js";
+import { conferirTokenDaExtensao } from "@/lib/lisaCodeAuth.js";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+/**
+ * POST /api/lisa-code/chat   headers: { "x-lisa-token": "..." }   body: { contents: Content[] }
+ *
+ * Um turno de conversa da Lisa Code (extensão do VS Code, uso PESSOAL — ver src/lib/gemini.js
+ * pra detalhes de por que a execução das ferramentas fica sempre do lado do cliente). `contents`
+ * é o histórico completo da conversa, já no formato do Gemini (a extensão é quem mantém esse
+ * estado). Devolve o próximo turno cru do modelo — texto e/ou chamadas de função.
+ */
+export async function POST(req) {
+  try {
+    const acesso = conferirTokenDaExtensao(req);
+    if (!acesso.ok) return jsonResponse({ ok: false, error: acesso.motivo }, 401);
+
+    const { contents, provedor } = await req.json();
+    if (!Array.isArray(contents) || !contents.length) return jsonResponse({ ok: false, error: "contents é obrigatório" }, 400);
+
+    // Só dois valores são aceitos, e qualquer outra coisa cai no Gemini. Sem essa trava, um
+    // valor com erro de digitação viraria "provedor desconhecido" num ponto bem mais fundo.
+    const escolhido = provedor === "groq" ? "groq" : "gemini";
+    const content = await runLisaCodeTurn(contents, { provedor: escolhido });
+    return jsonResponse({ ok: true, content, provedor: escolhido });
+  } catch (err) {
+    const keySuffix = err?.keyLabel ? ` [${err.keyLabel}]` : "";
+    return jsonResponse({ ok: false, error: `${String(err?.message || err)}${keySuffix}` }, 500);
+  }
+}
